@@ -5,7 +5,9 @@ Executes development tasks via Claude Code CLI in headless (non-interactive) mod
 import json
 import logging
 import os
+import re
 import subprocess
+from datetime import datetime, timezone
 
 TIMEOUT_SECONDS = 600  # 10 minutes
 
@@ -125,3 +127,179 @@ def execute_task(task_content: str, directory_path: str) -> dict:
         "git_diff": get_git_diff(directory_path),
         "error": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Branch-based execution helpers (Level-2 flow)
+# ---------------------------------------------------------------------------
+
+_FIX_WORDS = {
+    "fix", "bug", "error", "broken", "crash", "patch",
+    "arregla", "arreglar", "corrige", "corregir", "falla", "repara", "reparar",
+}
+_FEAT_WORDS = {
+    "add", "new", "create", "implement", "introduce",
+    "añade", "añadir", "crea", "crear", "agrega", "agregar",
+    "implementa", "implementar", "nueva", "nuevo",
+}
+_STOP_WORDS = {
+    "a", "an", "the", "in", "on", "at", "to", "for", "of", "and", "or", "with",
+    "el", "la", "los", "las", "un", "una", "de", "del", "en", "con",
+    "por", "para", "que", "se", "es", "al", "y", "o", "su",
+}
+
+
+def _git(args: list, cwd: str, timeout: int = 30) -> tuple:
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def _classify_task(task_content: str) -> str:
+    words = set(re.sub(r"[^\w\s]", " ", task_content.lower()).split())
+    if words & _FIX_WORDS:
+        return "fix"
+    if words & _FEAT_WORDS:
+        return "feat"
+    return "chore"
+
+
+def _make_branch_name(task_content: str) -> str:
+    prefix = _classify_task(task_content)
+    all_words = re.sub(r"[^\w\s]", " ", task_content.lower()).split()
+    meaningful = [w for w in all_words if w not in _STOP_WORDS and len(w) > 2]
+    slug = re.sub(r"[^a-z0-9]+", "-", " ".join(meaningful[:4])).strip("-") or "task"
+    suffix = datetime.now(timezone.utc).strftime("%H%M%S")
+    return f"{prefix}/{slug}-{suffix}"
+
+
+_COMMIT_INSTRUCTIONS = """
+After completing the task, if you made any changes, commit them:
+  git add -A
+  git commit -m "<message>"
+
+Commit message rules (follow strictly):
+- language: English
+- style: imperative mood, all lowercase (e.g. "add login handler", "fix null check in parser")
+- max 72 characters
+- describe what changed in the code, not the task description
+- no "Co-authored-by", no "Generated with", no signatures of any kind"""
+
+
+def _fallback_commit_message(branch_name: str) -> str:
+    # Derive a plain English message from the branch slug, avoiding Spanish task text.
+    # "feat/add-docstring-main-143215" -> "add docstring main"
+    slug = branch_name.split("/", 1)[-1]
+    slug = re.sub(r"-\d{6}$", "", slug)  # strip HHMMSS suffix
+    return slug.replace("-", " ")
+
+
+def _fallback_commit(branch_name: str, directory_path: str) -> str | None:
+    """
+    Fallback used only when claude -p did not commit despite leaving changes.
+    Stages everything and commits with a generic English message derived from the branch name.
+    Returns None on success, error string on failure.
+    """
+    rc, porcelain, _ = _git(["status", "--porcelain"], directory_path)
+    if rc != 0 or not porcelain:
+        return None  # nothing to commit
+
+    rc, _, err = _git(["add", "-A"], directory_path)
+    if rc != 0:
+        return f"git add falló: {err}"
+
+    rc, _, err = _git(["commit", "-m", _fallback_commit_message(branch_name)], directory_path)
+    if rc != 0:
+        return f"git commit falló: {err}"
+
+    return None
+
+
+def _checkout_safe(branch: str, directory_path: str) -> None:
+    """
+    Returns to branch. If the repo is dirty (uncommitted changes remain after a failed
+    auto-commit), force-checkout to avoid carrying those changes into the original branch.
+    """
+    rc, porcelain, _ = _git(["status", "--porcelain"], directory_path)
+    is_dirty = rc == 0 and bool(porcelain)
+
+    if is_dirty:
+        # Discard residual changes — they're already captured in the result's git_diff.
+        logger.warning(
+            "Repo sucio al volver a '%s'; descartando cambios sin commit antes del checkout",
+            branch,
+        )
+        rc, _, err = _git(["checkout", "-f", branch], directory_path)
+    else:
+        rc, _, err = _git(["checkout", branch], directory_path)
+
+    if rc != 0:
+        logger.critical("No se pudo volver a la rama '%s': %s", branch, err)
+
+
+def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
+    """
+    Level-2 flow: creates a typed branch (feat/fix/chore), runs the task there asking
+    claude -p to commit its own changes with a proper English message, then always
+    returns to the original branch. Never merges to main.
+
+    Extra keys in the returned dict:
+      branch            — name of the created branch
+      auto_commit_error — present only if the fallback commit step was needed and failed
+    """
+    rc, original_branch, err = _git(["rev-parse", "--abbrev-ref", "HEAD"], directory_path)
+    if rc != 0:
+        return {
+            "error": f"No se pudo obtener la rama actual: {err}",
+            "result": None,
+            "cost_usd": None,
+            "session_id": None,
+            "branch": None,
+            "git_diff": None,
+        }
+
+    branch_name = _make_branch_name(task_content)
+    rc, _, err = _git(["checkout", "-b", branch_name], directory_path)
+    if rc != 0:
+        return {
+            "error": f"No se pudo crear la rama '{branch_name}': {err}",
+            "result": None,
+            "cost_usd": None,
+            "session_id": None,
+            "branch": None,
+            "git_diff": None,
+        }
+
+    enriched_prompt = task_content + _COMMIT_INSTRUCTIONS
+
+    try:
+        result = execute_task(enriched_prompt, directory_path)
+        result["branch"] = branch_name
+
+        # Replace git_diff with a diff against the original branch so it captures
+        # committed changes too (git diff HEAD only shows uncommitted changes).
+        rc, branch_diff, _ = _git(["diff", original_branch], directory_path, timeout=15)
+        if rc == 0:
+            diff = branch_diff[:5000] + ("…(truncado)" if len(branch_diff) > 5000 else "")
+            result["git_diff"] = diff or "(sin cambios respecto a la rama original)"
+
+        # Fallback: if claude -p left changes uncommitted, commit them with a generic message.
+        if result.get("error") is None:
+            rc, porcelain, _ = _git(["status", "--porcelain"], directory_path)
+            if rc == 0 and porcelain:
+                logger.warning(
+                    "claude -p no comiteó en '%s'; aplicando commit de fallback", branch_name
+                )
+                commit_err = _fallback_commit(branch_name, directory_path)
+                if commit_err:
+                    logger.error("Fallback commit fallido en '%s': %s", branch_name, commit_err)
+                    result["auto_commit_error"] = commit_err
+    finally:
+        _checkout_safe(original_branch, directory_path)
+
+    return result
