@@ -5,6 +5,7 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+      - /opt/foncu_assitant:/opt/foncu_assitant
     environment:
       - DB_PATH=/app/data/assistant.db
     logging:
