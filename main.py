@@ -6,6 +6,7 @@ Telegram <-> Claude <-> Todoist, con Topics de Telegram mapeados a proyectos.
 import json
 import logging
 import os
+from datetime import time as dt_time
 from typing import Any
 
 from anthropic import Anthropic
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+import digitalocean_client
 import provider_factory
 import todoist_client
 from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")
 
 claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 provider = provider_factory.get_task_provider()
@@ -90,7 +93,11 @@ Cuando muestres tareas o proyectos, formatea la respuesta de forma clara y conci
 
 IMPORTANTE — vincular_carpeta_proyecto asocia un proyecto de Todoist a una carpeta local
 del servidor para poder ejecutar tareas de desarrollo en ella. Úsala cuando Juan quiera
-configurar en qué directorio se ejecutan las tareas de un proyecto concreto."""
+configurar en qué directorio se ejecutan las tareas de un proyecto concreto.
+
+Puedes consultar el gasto de infraestructura de Juan en DigitalOcean con
+consultar_gasto_digitalocean (sin parámetros). Úsala cuando pregunte por el coste,
+saldo o factura del mes en curso."""
 
 
 def _load_capabilities() -> str:
@@ -285,6 +292,14 @@ TOOLS = [
             "required": ["task_id"],
         },
     },
+    {
+        "name": "consultar_gasto_digitalocean",
+        "description": (
+            "Consulta el saldo y el gasto del mes en curso en DigitalOcean. "
+            "No requiere parámetros."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -371,7 +386,25 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
                 }
         return cc_execute_task_on_branch(task_content, directory_path)
 
+    if name == "consultar_gasto_digitalocean":
+        return digitalocean_client.get_balance()
+
     raise ValueError(f"Herramienta desconocida: {name}")
+
+
+async def weekly_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        balance = digitalocean_client.get_balance()
+        month_usage = balance.get("month_to_date_usage", "?")
+        account_balance = balance.get("account_balance", "?")
+        text = (
+            "Resumen semanal — DigitalOcean\n"
+            f"Gasto del mes en curso: ${month_usage}\n"
+            f"Saldo de la cuenta: ${account_balance}"
+        )
+        await context.bot.send_message(chat_id=int(OWNER_CHAT_ID), text=text)
+    except Exception:
+        logger.exception("Error en el chequeo semanal de DigitalOcean")
 
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -453,6 +486,12 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Chequeo semanal de gasto DO: todos los lunes a las 8:00 UTC
+    if OWNER_CHAT_ID:
+        app.job_queue.run_daily(weekly_do_check, time=dt_time(8, 0), days=(0,))
+    else:
+        logger.error("OWNER_CHAT_ID no configurado, chequeo semanal de DigitalOcean desactivado")
 
     logger.info("Bot arrancado. Esperando mensajes...")
     app.run_polling()
