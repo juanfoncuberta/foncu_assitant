@@ -19,6 +19,7 @@ from claude_code_executor import check_git_status, execute_task_on_branch as cc_
 from conversation_memory import add_message, get_history, get_summary, reset_topic, trim_and_summarize
 from project_directory_map import get_directory as get_project_directory, set_directory as set_project_directory
 from project_map import get_project_id, set_project_id
+from semantic_memory import add_semantic_memory, search_similar
 
 load_dotenv()
 
@@ -393,7 +394,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if summary:
         system += f"\n\nResumen de la conversación anterior con el usuario:\n{summary}"
 
-    messages: list[dict] = get_history(chat_id, thread_id) + [{"role": "user", "content": user_text}]
+    history = get_history(chat_id, thread_id)
+    history_contents = {m["content"] for m in history}
+
+    similar = search_similar(chat_id, user_text)
+    relevant = [m for m in similar if m["content"] not in history_contents]
+    if relevant:
+        lines = "\n".join(f"- [{m['role']}]: {m['content']}" for m in relevant)
+        system += f"\n\nContexto relevante de conversaciones anteriores (similitud semántica):\n{lines}"
+
+    messages: list[dict] = history + [{"role": "user", "content": user_text}]
 
     while True:
         response = claude.messages.create(
@@ -434,6 +444,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if reply_text:
         add_message(chat_id, thread_id, "user", user_text)
         add_message(chat_id, thread_id, "assistant", reply_text)
+        add_semantic_memory(chat_id, thread_id, "user", user_text)
+        add_semantic_memory(chat_id, thread_id, "assistant", reply_text)
         trim_and_summarize(chat_id, thread_id, claude)
 
 
