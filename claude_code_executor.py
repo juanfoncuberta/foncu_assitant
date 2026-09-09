@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import subprocess
+import unicodedata
 from datetime import datetime, timezone
 
 TIMEOUT_SECONDS = 600  # 10 minutes
@@ -171,7 +172,9 @@ def _classify_task(task_content: str) -> str:
 
 def _make_branch_name(task_content: str) -> str:
     prefix = _classify_task(task_content)
-    all_words = re.sub(r"[^\w\s]", " ", task_content.lower()).split()
+    normalized = unicodedata.normalize("NFD", task_content.lower())
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    all_words = re.sub(r"[^\w\s]", " ", ascii_text).split()
     meaningful = [w for w in all_words if w not in _STOP_WORDS and len(w) > 2]
     slug = re.sub(r"[^a-z0-9]+", "-", " ".join(meaningful[:4])).strip("-") or "task"
     suffix = datetime.now(timezone.utc).strftime("%H%M%S")

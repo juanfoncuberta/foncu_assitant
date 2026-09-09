@@ -19,7 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py .
 COPY AGENT_CAPABILITIES.md .
 
-RUN useradd -m botuser && chown -R botuser:botuser /app
+RUN useradd -m botuser && chown -R botuser:botuser /app \
+    && su botuser -c "git config --global user.email 'juan.foncuberta@gmail.com'" \
+    && su botuser -c "git config --global user.name 'Juan Foncuberta'"
 USER botuser
 
 CMD ["python", "main.py"]
