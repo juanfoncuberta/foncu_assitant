@@ -17,6 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py .
+COPY AGENT_CAPABILITIES.md .
 
 RUN useradd -m botuser && chown -R botuser:botuser /app
 USER botuser
