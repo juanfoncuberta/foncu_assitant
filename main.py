@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import provider_factory
 import todoist_client
-from claude_code_executor import check_git_status, execute_task as cc_execute_task
+from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
 from conversation_memory import add_message, get_history, get_summary, reset_topic, trim_and_summarize
 from project_directory_map import get_directory as get_project_directory, set_directory as set_project_directory
 from project_map import get_project_id, set_project_id
@@ -368,7 +368,7 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
                     "task_content": task_content,
                     "directory_path": directory_path,
                 }
-        return cc_execute_task(task_content, directory_path)
+        return cc_execute_task_on_branch(task_content, directory_path)
 
     raise ValueError(f"Herramienta desconocida: {name}")
 
