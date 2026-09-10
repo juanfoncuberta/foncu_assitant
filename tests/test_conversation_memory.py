@@ -104,3 +104,84 @@ def test_summary_isolated_by_topic():
     cm._set_summary(1, 2, "summary topic 2")
     assert cm.get_summary(1, 1) == "summary topic 1"
     assert cm.get_summary(1, 2) == "summary topic 2"
+
+
+def test_different_chats_none_topic_are_isolated():
+    """The real bug: two distinct chat_ids both with topic_id=None must never share data.
+    Both store topic_id as _NONE_SENTINEL=0, so isolation depends on chat_id alone."""
+    cm.add_message(111, None, "user", "mensaje del chat 111")
+    cm.add_message(222, None, "user", "mensaje del chat 222")
+
+    assert cm.get_history(111, None) == [{"role": "user", "content": "mensaje del chat 111"}]
+    assert cm.get_history(222, None) == [{"role": "user", "content": "mensaje del chat 222"}]
+
+    cm._set_summary(111, None, "resumen 111")
+    cm._set_summary(222, None, "resumen 222")
+
+    assert cm.get_summary(111, None) == "resumen 111"
+    assert cm.get_summary(222, None) == "resumen 222"
+
+
+# ---------------------------------------------------------------------------
+# trim_and_summarize
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock
+
+
+def _make_mock_client(summary_text: str = "resumen generado") -> MagicMock:
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(text=summary_text)]
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = mock_response
+    return mock_client
+
+
+def test_trim_and_summarize_noop_when_at_limit():
+    for i in range(cm.MAX_HISTORY):
+        cm.add_message(1, 1, "user", f"msg{i}")
+    mock_client = _make_mock_client()
+    cm.trim_and_summarize(1, 1, mock_client)
+    mock_client.messages.create.assert_not_called()
+    assert len(cm.get_history(1, 1)) == cm.MAX_HISTORY
+
+
+def test_trim_and_summarize_triggers_above_limit():
+    for i in range(cm.MAX_HISTORY + 3):
+        cm.add_message(1, 1, "user", f"msg{i}")
+    mock_client = _make_mock_client("nuevo resumen")
+    cm.trim_and_summarize(1, 1, mock_client)
+    mock_client.messages.create.assert_called_once()
+    assert cm.get_summary(1, 1) == "nuevo resumen"
+
+
+def test_trim_and_summarize_deletes_compressed_messages():
+    total = cm.MAX_HISTORY + 5
+    for i in range(total):
+        cm.add_message(1, 1, "user", f"msg{i}")
+    cm.trim_and_summarize(1, 1, _make_mock_client())
+    history = cm.get_history(1, 1)
+    assert len(history) == cm.MAX_HISTORY
+    assert history[0]["content"] == "msg5"
+    assert history[-1]["content"] == f"msg{total - 1}"
+
+
+def test_trim_and_summarize_combines_existing_summary():
+    cm._set_summary(1, 1, "resumen previo")
+    for i in range(cm.MAX_HISTORY + 2):
+        cm.add_message(1, 1, "user", f"msg{i}")
+    mock_client = _make_mock_client("resumen combinado")
+    cm.trim_and_summarize(1, 1, mock_client)
+    prompt_text = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "resumen previo" in prompt_text
+    assert cm.get_summary(1, 1) == "resumen combinado"
+
+
+def test_trim_and_summarize_no_existing_summary_prompt():
+    for i in range(cm.MAX_HISTORY + 1):
+        cm.add_message(1, 1, "user", f"msg{i}")
+    mock_client = _make_mock_client("primer resumen")
+    cm.trim_and_summarize(1, 1, mock_client)
+    prompt_text = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "Resumen previo" not in prompt_text
+    assert cm.get_summary(1, 1) == "primer resumen"
