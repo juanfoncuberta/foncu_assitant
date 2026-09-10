@@ -30,3 +30,14 @@ class TodoistProvider(TaskProvider):
 
     def list_projects(self) -> list[dict]:
         return todoist_client.list_projects()
+
+    def resolve_project(self, project_name: str) -> dict:
+        """Returns the project with the given name, creating it if it doesn't exist."""
+        projects = self.list_projects()
+        project = next(
+            (p for p in projects if isinstance(p, dict) and p["name"].lower() == project_name.lower()),
+            None,
+        )
+        if project is None:
+            project = self.create_project(project_name)
+        return project

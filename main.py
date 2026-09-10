@@ -288,18 +288,9 @@ TOOLS = [
 ]
 
 
-def _resolve_project(name: str) -> dict:
-    """Devuelve el proyecto con ese nombre; lo crea si no existe."""
-    projects = provider.list_projects()
-    project = next((p for p in projects if isinstance(p, dict) and p["name"].lower() == name.lower()), None)
-    if project is None:
-        project = provider.create_project(name)
-    return project
-
-
 def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id: int | None) -> Any:
     if name == "vincular_proyecto":
-        project = _resolve_project(tool_input["project_name"])
+        project = provider.resolve_project(tool_input["project_name"])
         set_project_id(chat_id, thread_id, project["id"], project["name"])
         return {"status": "ok", "project_id": project["id"], "project_name": project["name"]}
 
@@ -308,7 +299,7 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
 
     if name == "crear_tarea":
         project = tool_input.get("project")
-        project_id = _resolve_project(project)["id"] if project else get_project_id(chat_id, thread_id)
+        project_id = provider.resolve_project(project)["id"] if project else get_project_id(chat_id, thread_id)
         return provider.create_task(
             content=tool_input["content"],
             due_string=tool_input.get("date"),
@@ -318,7 +309,7 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
 
     if name == "listar_tareas":
         project = tool_input.get("project")
-        project_id = _resolve_project(project)["id"] if project else get_project_id(chat_id, thread_id)
+        project_id = provider.resolve_project(project)["id"] if project else get_project_id(chat_id, thread_id)
         return provider.list_tasks(project_id=project_id)
 
     if name == "actualizar_prioridad":

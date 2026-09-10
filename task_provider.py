@@ -29,3 +29,6 @@ class TaskProvider(ABC):
 
     @abstractmethod
     def list_projects(self) -> list[dict]: ...
+
+    @abstractmethod
+    def resolve_project(self, project_name: str) -> dict: ...
