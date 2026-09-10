@@ -1,4 +1,6 @@
 import pytest
+import httpx
+from unittest.mock import MagicMock
 
 import todoist_client
 
@@ -154,3 +156,40 @@ def test_update_task_priority(http):
         headers={"Authorization": "Bearer test-token"},
     )
     assert result["priority"] == 4
+
+
+# ---------------------------------------------------------------------------
+# HTTP error paths — raise_for_status must propagate, not fail silently
+# ---------------------------------------------------------------------------
+
+
+def _http_error(status_code: int) -> httpx.HTTPStatusError:
+    return httpx.HTTPStatusError(
+        str(status_code),
+        request=MagicMock(),
+        response=MagicMock(status_code=status_code),
+    )
+
+
+def test_create_task_raises_on_429(http):
+    http.post.return_value.raise_for_status.side_effect = _http_error(429)
+    with pytest.raises(httpx.HTTPStatusError):
+        todoist_client.create_task("Task")
+
+
+def test_create_task_raises_on_401(http):
+    http.post.return_value.raise_for_status.side_effect = _http_error(401)
+    with pytest.raises(httpx.HTTPStatusError):
+        todoist_client.create_task("Task")
+
+
+def test_list_tasks_raises_on_429(http):
+    http.get.return_value.raise_for_status.side_effect = _http_error(429)
+    with pytest.raises(httpx.HTTPStatusError):
+        todoist_client.list_tasks()
+
+
+def test_get_task_raises_on_401(http):
+    http.get.return_value.raise_for_status.side_effect = _http_error(401)
+    with pytest.raises(httpx.HTTPStatusError):
+        todoist_client.get_task("5")
