@@ -16,6 +16,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import provider_factory
 import todoist_client
 from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
+from content_sources import add_source as add_content_source
 from conversation_memory import add_message, get_history, get_summary, reset_topic, trim_and_summarize
 from project_directory_map import get_directory as get_project_directory, set_directory as set_project_directory
 from project_map import get_project_id, set_project_id
@@ -90,7 +91,10 @@ Cuando muestres tareas o proyectos, formatea la respuesta de forma clara y conci
 
 IMPORTANTE — vincular_carpeta_proyecto asocia un proyecto de Todoist a una carpeta local
 del servidor para poder ejecutar tareas de desarrollo en ella. Úsala cuando Juan quiera
-configurar en qué directorio se ejecutan las tareas de un proyecto concreto."""
+configurar en qué directorio se ejecutan las tareas de un proyecto concreto.
+
+Usa añadir_fuente_contenido cuando Juan quiera registrar un nuevo feed o fuente de
+contenido (blogs, RSS, newsletters) para el agente de LinkedIn/X."""
 
 
 def _load_capabilities() -> str:
@@ -270,6 +274,31 @@ TOOLS = [
         },
     },
     {
+        "name": "añadir_fuente_contenido",
+        "description": (
+            "Registra una nueva fuente de contenido (blog, RSS, newsletter) para el agente "
+            "de LinkedIn/X. Las fuentes activas son consultadas periódicamente para generar posts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Nombre descriptivo de la fuente (ej: 'One Useful Thing')",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL del feed (ej: 'https://www.oneusefulthing.org/feed')",
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Tipo de fuente: 'rss', 'newsletter', 'web', etc.",
+                },
+            },
+            "required": ["name", "url", "type"],
+        },
+    },
+    {
         "name": "eliminar_tarea",
         "description": (
             "Elimina permanentemente una tarea de Todoist (borrado real, no completar). "
@@ -322,6 +351,9 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
     if name == "eliminar_tarea":
         provider.delete_task(tool_input["task_id"])
         return {"status": "eliminada"}
+
+    if name == "añadir_fuente_contenido":
+        return add_content_source(tool_input["name"], tool_input["url"], tool_input["type"])
 
     if name == "vincular_carpeta_proyecto":
         set_project_directory(tool_input["project_id"], tool_input["directory_path"])
