@@ -6,13 +6,63 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 
 TIMEOUT_SECONDS = 600  # 10 minutes
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# dev_log — persists Level-2 execution summaries (self-contained, no foreign deps)
+# ---------------------------------------------------------------------------
+
+
+def _dev_log_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dev_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_content TEXT    NOT NULL,
+            branch       TEXT    NOT NULL,
+            summary      TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _save_dev_log(task_content: str, branch: str, summary: str) -> None:
+    with _dev_log_conn() as conn:
+        conn.execute(
+            "INSERT INTO dev_log (task_content, branch, summary) VALUES (?, ?, ?)",
+            (task_content, branch, summary),
+        )
+
+
+def get_recent_dev_log_entries(since_days: int = 7) -> list[dict]:
+    with _dev_log_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, task_content, branch, summary, created_at
+            FROM dev_log
+            WHERE created_at >= datetime('now', ?)
+            ORDER BY id DESC
+            """,
+            (f"-{since_days} days",),
+        ).fetchall()
+    return [
+        {"id": r[0], "task_content": r[1], "branch": r[2], "summary": r[3], "created_at": r[4]}
+        for r in rows
+    ]
 
 
 def check_git_status(directory_path: str) -> dict:
@@ -191,7 +241,10 @@ Commit message rules (follow strictly):
 - style: imperative mood, all lowercase (e.g. "add login handler", "fix null check in parser")
 - max 72 characters
 - describe what changed in the code, not the task description
-- no "Co-authored-by", no "Generated with", no signatures of any kind"""
+- no "Co-authored-by", no "Generated with", no signatures of any kind
+
+In your final response, include 2-4 sentences describing: what the problem or goal was,
+what you changed, and why that approach solves it."""
 
 
 def _fallback_commit_message(branch_name: str) -> str:
@@ -302,6 +355,8 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
                 if commit_err:
                     logger.error("Fallback commit fallido en '%s': %s", branch_name, commit_err)
                     result["auto_commit_error"] = commit_err
+
+            _save_dev_log(task_content, branch_name, result.get("result") or "")
     finally:
         _checkout_safe(original_branch, directory_path)
 

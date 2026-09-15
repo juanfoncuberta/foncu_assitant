@@ -373,3 +373,78 @@ class TestExecuteTaskOnBranch:
         # The only commit-like call should NOT be a git commit
         all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
         assert not any(cmd.startswith("git commit") for cmd in all_cmds)
+
+
+# ---------------------------------------------------------------------------
+# dev_log — _save_dev_log / get_recent_dev_log_entries
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def isolated_dev_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))
+
+
+class TestDevLog:
+    def test_save_and_retrieve(self, isolated_dev_db):
+        ce._save_dev_log("add feature X", "feat/feature-x-120000", "Added feature X to solve Y.")
+        entries = ce.get_recent_dev_log_entries(since_days=1)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["task_content"] == "add feature X"
+        assert e["branch"] == "feat/feature-x-120000"
+        assert e["summary"] == "Added feature X to solve Y."
+        assert "created_at" in e
+
+    def test_empty_table_returns_empty_list(self, isolated_dev_db):
+        assert ce.get_recent_dev_log_entries() == []
+
+    def test_multiple_entries_ordered_newest_first(self, isolated_dev_db):
+        ce._save_dev_log("task A", "feat/a-000001", "Summary A")
+        ce._save_dev_log("task B", "feat/b-000002", "Summary B")
+        entries = ce.get_recent_dev_log_entries(since_days=1)
+        assert len(entries) == 2
+        # Most recent insert (B) should come first (ORDER BY created_at DESC)
+        assert entries[0]["task_content"] == "task B"
+        assert entries[1]["task_content"] == "task A"
+
+    def test_since_days_filters_old_entries(self, isolated_dev_db):
+        import sqlite3 as _sq
+        # Insert a recent and an old entry directly, bypassing datetime('now')
+        conn = _sq.connect(ce.DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS dev_log (id INTEGER PRIMARY KEY AUTOINCREMENT, task_content TEXT NOT NULL, branch TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))")
+        conn.execute("INSERT INTO dev_log (task_content, branch, summary, created_at) VALUES (?, ?, ?, ?)",
+                     ("old task", "chore/old-000000", "old summary", "2000-01-01T00:00:00"))
+        conn.execute("INSERT INTO dev_log (task_content, branch, summary, created_at) VALUES (?, ?, ?, ?)",
+                     ("recent task", "feat/recent-000000", "recent summary", "2099-01-01T00:00:00"))
+        conn.commit()
+        conn.close()
+        entries = ce.get_recent_dev_log_entries(since_days=7)
+        contents = [e["task_content"] for e in entries]
+        assert "recent task" in contents
+        assert "old task" not in contents
+
+    def test_all_expected_fields_present(self, isolated_dev_db):
+        ce._save_dev_log("task", "fix/task-120000", "summary")
+        entry = ce.get_recent_dev_log_entries(since_days=1)[0]
+        for key in ("id", "task_content", "branch", "summary", "created_at"):
+            assert key in entry
+
+
+class TestExecuteTaskOnBranchDevLog:
+    def test_saves_dev_log_on_success(self, mocker, tmp_path, monkeypatch):
+        monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))
+        mocker.patch("subprocess.run", side_effect=_branch_exec_calls(
+            claude_stdout=_json_output("The task was done by adding X because Y.")
+        ))
+        ce.execute_task_on_branch("add feature", "/path")
+        entries = ce.get_recent_dev_log_entries(since_days=1)
+        assert len(entries) == 1
+        assert entries[0]["summary"] == "The task was done by adding X because Y."
+        assert entries[0]["task_content"] == "add feature"
+
+    def test_does_not_save_dev_log_on_error(self, mocker, tmp_path, monkeypatch):
+        monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))
+        mocker.patch("subprocess.run", side_effect=_branch_exec_calls(claude_rc=1))
+        ce.execute_task_on_branch("add feature", "/path")
+        assert ce.get_recent_dev_log_entries(since_days=1) == []
