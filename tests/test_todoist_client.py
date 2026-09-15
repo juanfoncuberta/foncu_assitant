@@ -1,6 +1,8 @@
-import pytest
-import httpx
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
+
+import httpx
+import pytest
 
 import todoist_client
 
@@ -193,3 +195,85 @@ def test_get_task_raises_on_401(http):
     http.get.return_value.raise_for_status.side_effect = _http_error(401)
     with pytest.raises(httpx.HTTPStatusError):
         todoist_client.get_task("5")
+
+
+# ---------------------------------------------------------------------------
+# get_completed_tasks
+# ---------------------------------------------------------------------------
+
+COMPLETED_URL = f"{BASE_URL}/tasks/completed/by_completion_date"
+
+
+def _completed_response(items: list[dict], next_cursor: str | None = None) -> MagicMock:
+    mock = MagicMock()
+    mock.json.return_value = {"items": items, "next_cursor": next_cursor}
+    return mock
+
+
+def test_get_completed_tasks_default_date_range(http, mocker):
+    fixed_now = datetime(2026, 9, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mocker.patch("todoist_client.datetime", wraps=datetime)
+    mocker.patch.object(todoist_client, "datetime", wraps=datetime)
+
+    http.get.return_value = _completed_response([{"id": "t1", "content": "Done task"}])
+
+    result = todoist_client.get_completed_tasks()
+
+    assert result == [{"id": "t1", "content": "Done task"}]
+    call_params = http.get.call_args[1]["params"]
+    assert "since" in call_params
+    assert "until" in call_params
+
+
+def test_get_completed_tasks_custom_dates(http):
+    http.get.return_value = _completed_response([{"id": "t2"}])
+
+    result = todoist_client.get_completed_tasks(since="2026-09-01T00:00:00Z", until="2026-09-08T00:00:00Z")
+
+    call_params = http.get.call_args[1]["params"]
+    assert call_params["since"] == "2026-09-01T00:00:00Z"
+    assert call_params["until"] == "2026-09-08T00:00:00Z"
+    assert result == [{"id": "t2"}]
+
+
+def test_get_completed_tasks_with_project_id(http):
+    http.get.return_value = _completed_response([{"id": "t3"}])
+
+    todoist_client.get_completed_tasks(project_id="proj-42")
+
+    call_params = http.get.call_args[1]["params"]
+    assert call_params["project_id"] == "proj-42"
+
+
+def test_get_completed_tasks_no_project_id_omits_param(http):
+    http.get.return_value = _completed_response([])
+
+    todoist_client.get_completed_tasks()
+
+    call_params = http.get.call_args[1]["params"]
+    assert "project_id" not in call_params
+
+
+def test_get_completed_tasks_pagination(http):
+    page1 = _completed_response([{"id": "t1"}, {"id": "t2"}], next_cursor="cursor-abc")
+    page2 = _completed_response([{"id": "t3"}], next_cursor=None)
+    http.get.side_effect = [page1, page2]
+
+    result = todoist_client.get_completed_tasks()
+
+    assert http.get.call_count == 2
+    assert result == [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}]
+    # Second call must include the cursor
+    second_params = http.get.call_args_list[1][1]["params"]
+    assert second_params["cursor"] == "cursor-abc"
+
+
+def test_get_completed_tasks_empty_result(http):
+    http.get.return_value = _completed_response([])
+    assert todoist_client.get_completed_tasks() == []
+
+
+def test_get_completed_tasks_raises_on_http_error(http):
+    http.get.return_value.raise_for_status.side_effect = _http_error(403)
+    with pytest.raises(httpx.HTTPStatusError):
+        todoist_client.get_completed_tasks()

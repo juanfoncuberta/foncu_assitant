@@ -11,6 +11,7 @@ Siempre se trabaja con valores de API (1-4) en este módulo.
 
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -103,3 +104,34 @@ def list_projects() -> list[dict]:
         r.raise_for_status()
         data = r.json()
         return data["results"] if isinstance(data, dict) else data
+
+
+def get_completed_tasks(
+    project_id: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    params: dict = {
+        "since": since or (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "until": until or now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if project_id:
+        params["project_id"] = project_id
+
+    tasks: list[dict] = []
+    with httpx.Client() as client:
+        while True:
+            r = client.get(
+                f"{BASE_URL}/tasks/completed/by_completion_date",
+                params=params,
+                headers=_headers(),
+            )
+            r.raise_for_status()
+            data = r.json()
+            tasks.extend(data.get("items", []))
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+            params["cursor"] = cursor
+    return tasks
