@@ -5,3 +5,4 @@ __pycache__/
 data/
 assistant.db
 .claude/
+connect_ocean.sh
