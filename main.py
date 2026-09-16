@@ -6,13 +6,16 @@ Telegram <-> Claude <-> Todoist, con Topics de Telegram mapeados a proyectos.
 import json
 import logging
 import os
+import threading
 from typing import Any
 
+import uvicorn
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+import internal_api
 import provider_factory
 import todoist_client
 from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
@@ -473,6 +476,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
+    api_thread = threading.Thread(
+        target=uvicorn.run,
+        kwargs={"app": internal_api.app, "host": "0.0.0.0", "port": 8001, "log_level": "warning"},
+        daemon=True,
+    )
+    api_thread.start()
+    logger.info("Internal API listening on port 8001")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
