@@ -93,7 +93,7 @@ IMPORTANTE — vincular_carpeta_proyecto asocia un proyecto de Todoist a una car
 del servidor para poder ejecutar tareas de desarrollo en ella. Úsala cuando Juan quiera
 configurar en qué directorio se ejecutan las tareas de un proyecto concreto.
 
-Usa añadir_fuente_contenido cuando Juan quiera registrar un nuevo feed o fuente de
+Usa anadir_fuente_contenido cuando Juan quiera registrar un nuevo feed o fuente de
 contenido (blogs, RSS, newsletters) para el agente de LinkedIn/X."""
 
 
@@ -274,7 +274,7 @@ TOOLS = [
         },
     },
     {
-        "name": "añadir_fuente_contenido",
+        "name": "anadir_fuente_contenido",
         "description": (
             "Registra una nueva fuente de contenido (blog, RSS, newsletter) para el agente "
             "de LinkedIn/X. Las fuentes activas son consultadas periódicamente para generar posts."
@@ -352,7 +352,7 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
         provider.delete_task(tool_input["task_id"])
         return {"status": "eliminada"}
 
-    if name == "añadir_fuente_contenido":
+    if name == "anadir_fuente_contenido":
         return add_content_source(tool_input["name"], tool_input["url"], tool_input["type"])
 
     if name == "vincular_carpeta_proyecto":
