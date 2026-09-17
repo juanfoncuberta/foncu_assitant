@@ -8,8 +8,14 @@ services:
       - /opt/foncu_assitant:/opt/foncu_assitant
     environment:
       - DB_PATH=/app/data/assistant.db
+    networks:
+      - foncu_net
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  foncu_net:
+    external: true
