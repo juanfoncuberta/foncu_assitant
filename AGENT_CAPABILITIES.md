@@ -5,6 +5,11 @@ y cuáles necesitan confirmación explícita previa. **Regla de oro:** la lista 
 en el código para cada agente debe coincidir exactamente con lo que este documento autoriza.
 Si una acción no aparece aquí como permitida, el agente no debe tener esa función disponible.
 
+Estos niveles son propios de **foncu_assistant** como sistema, no de un canal concreto.
+Hoy el único cliente es el bot de Telegram, pero si el día de mañana se conecta otro
+cliente (web, WhatsApp, etc.) contra el mismo backend, hereda estos mismos niveles sin
+tener que redefinirlos.
+
 ---
 
 ## Nivel 1 — Autónomo, sin aviso previo ni posterior
@@ -63,7 +68,7 @@ Para `ejecutar_tarea_dev` en este caso, el agente debe:
 
 ## Permisos de Claude Code dentro de `ejecutar_tarea_dev`
 
-Los niveles de arriba gobiernan qué puede llamar el bot de Telegram por su cuenta.
+Los niveles de arriba gobiernan qué puede llamar foncu_assistant por su cuenta, sin importar qué cliente (Telegram u otro futuro) haya originado la petición.
 Esta sección es distinta: gobierna qué puede hacer **Claude Code** una vez que
 `claude_code_executor.py` lo invoca en modo headless para una tarea concreta.
 
