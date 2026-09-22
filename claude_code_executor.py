@@ -36,15 +36,18 @@ def _dev_log_conn() -> sqlite3.Connection:
         )
         """
     )
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(dev_log)")}
+    if "plan" not in existing_cols:
+        conn.execute("ALTER TABLE dev_log ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
 
 
-def _save_dev_log(task_content: str, branch: str, summary: str) -> None:
+def _save_dev_log(task_content: str, branch: str, summary: str, plan: str = "") -> None:
     with _dev_log_conn() as conn:
         conn.execute(
-            "INSERT INTO dev_log (task_content, branch, summary) VALUES (?, ?, ?)",
-            (task_content, branch, summary),
+            "INSERT INTO dev_log (task_content, branch, summary, plan) VALUES (?, ?, ?, ?)",
+            (task_content, branch, summary, plan),
         )
 
 
@@ -52,7 +55,7 @@ def get_recent_dev_log_entries(since_days: int = 7) -> list[dict]:
     with _dev_log_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, task_content, branch, summary, created_at
+            SELECT id, task_content, branch, summary, plan, created_at
             FROM dev_log
             WHERE created_at >= datetime('now', ?)
             ORDER BY id DESC
@@ -60,7 +63,14 @@ def get_recent_dev_log_entries(since_days: int = 7) -> list[dict]:
             (f"-{since_days} days",),
         ).fetchall()
     return [
-        {"id": r[0], "task_content": r[1], "branch": r[2], "summary": r[3], "created_at": r[4]}
+        {
+            "id": r[0],
+            "task_content": r[1],
+            "branch": r[2],
+            "summary": r[3],
+            "plan": r[4],
+            "created_at": r[5],
+        }
         for r in rows
     ]
 
@@ -184,6 +194,54 @@ def execute_task(task_content: str, directory_path: str) -> dict:
 # Branch-based execution helpers (Level-2 flow)
 # ---------------------------------------------------------------------------
 
+PLAN_TIMEOUT_SECONDS = 120
+
+_PLAN_PROMPT_TEMPLATE = """You are about to perform the following development task, but you must NOT \
+make any changes yet — this is a planning-only step.
+
+Describe, in 2-4 concise sentences, the plan you would follow: which files you would touch \
+and what you would change in each.
+
+Task:
+{task_content}"""
+
+
+def _get_plan(task_content: str, directory_path: str) -> str:
+    """
+    Read-only planning call (no Edit/Write/Bash tools): asks Claude Code to describe the
+    approach it would take *before* any code is touched, so the plan can later be compared
+    against the real diff. Never raises — returns a fallback string on any failure.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "claude",
+                "-p", _PLAN_PROMPT_TEMPLATE.format(task_content=task_content),
+                "--output-format", "json",
+                "--disallowedTools", "Edit,Write,Bash",
+                "--add-dir", directory_path,
+            ],
+            cwd=directory_path,
+            capture_output=True,
+            text=True,
+            timeout=PLAN_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception("Fallo al obtener el plan previo a la ejecución")
+        return "(no se pudo obtener el plan previo)"
+
+    if proc.returncode != 0:
+        logger.warning("Plan previo: claude -p exited %d", proc.returncode)
+        return "(no se pudo obtener el plan previo)"
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return "(no se pudo obtener el plan previo)"
+
+    return (data.get("result") or "").strip() or "(plan vacío)"
+
+
 _FIX_WORDS = {
     "fix", "bug", "error", "broken", "crash", "patch",
     "arregla", "arreglar", "corrige", "corregir", "falla", "repara", "reparar",
@@ -306,6 +364,8 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
 
     Extra keys in the returned dict:
       branch            — name of the created branch
+      plan              — plan described by a read-only claude -p call before any change,
+                           made for the reviewer subagent to compare against the real diff
       auto_commit_error — present only if the fallback commit step was needed and failed
     """
     rc, original_branch, err = _git(["rev-parse", "--abbrev-ref", "HEAD"], directory_path)
@@ -331,11 +391,14 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
             "git_diff": None,
         }
 
+    plan = _get_plan(task_content, directory_path)
+
     enriched_prompt = task_content + _COMMIT_INSTRUCTIONS
 
     try:
         result = execute_task(enriched_prompt, directory_path)
         result["branch"] = branch_name
+        result["plan"] = plan
 
         # Replace git_diff with a diff against the original branch so it captures
         # committed changes too (git diff HEAD only shows uncommitted changes).
@@ -356,7 +419,7 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
                     logger.error("Fallback commit fallido en '%s': %s", branch_name, commit_err)
                     result["auto_commit_error"] = commit_err
 
-            _save_dev_log(task_content, branch_name, result.get("result") or "")
+            _save_dev_log(task_content, branch_name, result.get("result") or "", plan=plan)
     finally:
         _checkout_safe(original_branch, directory_path)
 

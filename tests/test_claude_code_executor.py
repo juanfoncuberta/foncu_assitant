@@ -248,6 +248,52 @@ class TestFallbackCommit:
 
 
 # ---------------------------------------------------------------------------
+# _get_plan
+# ---------------------------------------------------------------------------
+
+
+class TestGetPlan:
+    def test_success(self, mocker):
+        mocker.patch(
+            "subprocess.run",
+            return_value=cp(0, _json_output("I would edit foo.py to add X.")),
+        )
+        plan = ce._get_plan("add feature", "/path")
+        assert plan == "I would edit foo.py to add X."
+
+    def test_uses_disallowed_tools_flag(self, mocker):
+        mock_run = mocker.patch("subprocess.run", return_value=cp(0, _json_output("plan")))
+        ce._get_plan("add feature", "/path")
+        args = mock_run.call_args.args[0]
+        assert "--disallowedTools" in args
+        idx = args.index("--disallowedTools")
+        assert args[idx + 1] == "Edit,Write,Bash"
+
+    def test_nonzero_exit_returns_fallback(self, mocker):
+        mocker.patch("subprocess.run", return_value=cp(1, "", "error"))
+        plan = ce._get_plan("add feature", "/path")
+        assert "no se pudo obtener el plan" in plan
+
+    def test_timeout_returns_fallback(self, mocker):
+        mocker.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=120),
+        )
+        plan = ce._get_plan("add feature", "/path")
+        assert "no se pudo obtener el plan" in plan
+
+    def test_malformed_json_returns_fallback(self, mocker):
+        mocker.patch("subprocess.run", return_value=cp(0, "not json"))
+        plan = ce._get_plan("add feature", "/path")
+        assert "no se pudo obtener el plan" in plan
+
+    def test_empty_result_returns_placeholder(self, mocker):
+        mocker.patch("subprocess.run", return_value=cp(0, _json_output("")))
+        plan = ce._get_plan("add feature", "/path")
+        assert plan == "(plan vacío)"
+
+
+# ---------------------------------------------------------------------------
 # execute_task_on_branch
 # ---------------------------------------------------------------------------
 
@@ -284,6 +330,10 @@ def _branch_exec_calls(
 
 
 class TestExecuteTaskOnBranch:
+    @pytest.fixture(autouse=True)
+    def _plan_mock(self, mocker):
+        mocker.patch("claude_code_executor._get_plan", return_value="mocked plan")
+
     def test_branch_prefix_matches_classify_task(self, mocker):
         mock_run = mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
         ce.execute_task_on_branch("add new feature", "/path")
@@ -394,7 +444,16 @@ class TestDevLog:
         assert e["task_content"] == "add feature X"
         assert e["branch"] == "feat/feature-x-120000"
         assert e["summary"] == "Added feature X to solve Y."
+        assert e["plan"] == ""
         assert "created_at" in e
+
+    def test_save_and_retrieve_with_plan(self, isolated_dev_db):
+        ce._save_dev_log(
+            "add feature X", "feat/feature-x-120000", "Added feature X to solve Y.",
+            plan="Would edit foo.py to add the X handler.",
+        )
+        entries = ce.get_recent_dev_log_entries(since_days=1)
+        assert entries[0]["plan"] == "Would edit foo.py to add the X handler."
 
     def test_empty_table_returns_empty_list(self, isolated_dev_db):
         assert ce.get_recent_dev_log_entries() == []
@@ -412,11 +471,11 @@ class TestDevLog:
         import sqlite3 as _sq
         # Insert a recent and an old entry directly, bypassing datetime('now')
         conn = _sq.connect(ce.DB_PATH)
-        conn.execute("CREATE TABLE IF NOT EXISTS dev_log (id INTEGER PRIMARY KEY AUTOINCREMENT, task_content TEXT NOT NULL, branch TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))")
-        conn.execute("INSERT INTO dev_log (task_content, branch, summary, created_at) VALUES (?, ?, ?, ?)",
-                     ("old task", "chore/old-000000", "old summary", "2000-01-01T00:00:00"))
-        conn.execute("INSERT INTO dev_log (task_content, branch, summary, created_at) VALUES (?, ?, ?, ?)",
-                     ("recent task", "feat/recent-000000", "recent summary", "2099-01-01T00:00:00"))
+        conn.execute("CREATE TABLE IF NOT EXISTS dev_log (id INTEGER PRIMARY KEY AUTOINCREMENT, task_content TEXT NOT NULL, branch TEXT NOT NULL, summary TEXT NOT NULL, plan TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')))")
+        conn.execute("INSERT INTO dev_log (task_content, branch, summary, plan, created_at) VALUES (?, ?, ?, ?, ?)",
+                     ("old task", "chore/old-000000", "old summary", "", "2000-01-01T00:00:00"))
+        conn.execute("INSERT INTO dev_log (task_content, branch, summary, plan, created_at) VALUES (?, ?, ?, ?, ?)",
+                     ("recent task", "feat/recent-000000", "recent summary", "", "2099-01-01T00:00:00"))
         conn.commit()
         conn.close()
         entries = ce.get_recent_dev_log_entries(since_days=7)
@@ -427,11 +486,27 @@ class TestDevLog:
     def test_all_expected_fields_present(self, isolated_dev_db):
         ce._save_dev_log("task", "fix/task-120000", "summary")
         entry = ce.get_recent_dev_log_entries(since_days=1)[0]
-        for key in ("id", "task_content", "branch", "summary", "created_at"):
+        for key in ("id", "task_content", "branch", "summary", "plan", "created_at"):
             assert key in entry
+
+    def test_migration_adds_plan_column_to_existing_table(self, isolated_dev_db):
+        """A pre-existing dev_log table (created before the 'plan' column existed) gets migrated."""
+        import sqlite3 as _sq
+        conn = _sq.connect(ce.DB_PATH)
+        conn.execute("CREATE TABLE dev_log (id INTEGER PRIMARY KEY AUTOINCREMENT, task_content TEXT NOT NULL, branch TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))")
+        conn.commit()
+        conn.close()
+
+        ce._save_dev_log("legacy task", "chore/legacy-000000", "legacy summary")
+        entries = ce.get_recent_dev_log_entries(since_days=1)
+        assert entries[0]["plan"] == ""
 
 
 class TestExecuteTaskOnBranchDevLog:
+    @pytest.fixture(autouse=True)
+    def _plan_mock(self, mocker):
+        mocker.patch("claude_code_executor._get_plan", return_value="mocked plan")
+
     def test_saves_dev_log_on_success(self, mocker, tmp_path, monkeypatch):
         monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))
         mocker.patch("subprocess.run", side_effect=_branch_exec_calls(
@@ -442,6 +517,7 @@ class TestExecuteTaskOnBranchDevLog:
         assert len(entries) == 1
         assert entries[0]["summary"] == "The task was done by adding X because Y."
         assert entries[0]["task_content"] == "add feature"
+        assert entries[0]["plan"] == "mocked plan"
 
     def test_does_not_save_dev_log_on_error(self, mocker, tmp_path, monkeypatch):
         monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))

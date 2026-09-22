@@ -4,5 +4,6 @@ __pycache__/
 *.pyc
 data/
 assistant.db
+assistant.db-journal
 .claude/settings.local.json
 connect_ocean.sh
