@@ -58,3 +58,25 @@ Para `ejecutar_tarea_dev` en este caso, el agente debe:
 > La lista de tools disponibles en el código para cada agente debe coincidir exactamente
 > con lo que este documento autoriza. Si una acción no está aquí como permitida, el agente
 > no debe tener esa función disponible para llamar.
+
+---
+
+## Permisos de Claude Code dentro de `ejecutar_tarea_dev`
+
+Los niveles de arriba gobiernan qué puede llamar el bot de Telegram por su cuenta.
+Esta sección es distinta: gobierna qué puede hacer **Claude Code** una vez que
+`claude_code_executor.py` lo invoca en modo headless para una tarea concreta.
+
+Hoy `execute_task()` lanza `claude` con `--permission-mode acceptEdits` pero sin
+ningún `--allowedTools` — es decir, no hay restricción real de herramientas todavía.
+La tabla siguiente es el objetivo a implementar (ver tarea de allowlist explícito):
+
+| Tipo de tarea                          | Tools permitidas                                                     |
+|-----------------------------------------|------------------------------------------------------------------------|
+| Consulta / lectura (sin cambios de código) | `Read`, `Glob`, `Grep` — sin `Edit`/`Write`, sin `Bash` de escritura |
+| Cambio acotado con tests (caso normal)  | `Read`, `Glob`, `Grep`, `Edit`, `Write`, `Bash` limitado a `pytest`/lint, siempre en una rama nueva |
+| Cambio estructural (varios módulos)    | Igual que el anterior + requiere que se haya declarado un plan (archivos a tocar y cambio en cada uno) antes de ejecutar |
+
+**Archivos prohibidos para cualquier tipo de tarea, sin aprobación manual explícita:**
+`.env`, `docker-compose.yml`, `Dockerfile`, `deploy.sh`, cualquier archivo bajo `.claude/`,
+y cualquier migración de base de datos.
