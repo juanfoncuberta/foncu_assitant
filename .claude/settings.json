@@ -3,5 +3,23 @@
     "commit": "",
     "pr": ""
   },
-  "includeCoAuthoredBy": false
+  "includeCoAuthoredBy": false,
+  "env": {
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "venv/bin/pytest -m \"not integration\" -q",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
 }
