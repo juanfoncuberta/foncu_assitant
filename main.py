@@ -3,12 +3,14 @@ Asistente personal — Milestone 2
 Telegram <-> Claude <-> Todoist, con Topics de Telegram mapeados a proyectos.
 """
 
+import calendar
 import json
 import logging
 import os
 import threading
-from datetime import time as dt_time
+from datetime import date, time as dt_time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import uvicorn
 from anthropic import Anthropic
@@ -38,6 +40,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")
+
+_LOCAL_TZ = ZoneInfo("Europe/Madrid")
 
 claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 provider = provider_factory.get_task_provider()
@@ -413,24 +417,57 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
         return cc_execute_task_on_branch(task_content, directory_path)
 
     if name == "consultar_gasto_digitalocean":
-        return digitalocean_client.get_balance()
+        return _digitalocean_summary()
 
     raise ValueError(f"Herramienta desconocida: {name}")
 
 
-async def weekly_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+def _digitalocean_summary() -> dict:
+    """Fetches the current DO balance and adds a naive linear month-end spend forecast."""
+    balance = digitalocean_client.get_balance()
+    summary = dict(balance)
     try:
-        balance = digitalocean_client.get_balance()
-        month_usage = balance.get("month_to_date_usage", "?")
-        account_balance = balance.get("account_balance", "?")
-        text = (
-            "Resumen semanal — DigitalOcean\n"
-            f"Gasto del mes en curso: ${month_usage}\n"
-            f"Saldo de la cuenta: ${account_balance}"
+        month_usage = float(balance.get("month_to_date_usage", 0))
+        today = date.today()
+        days_in_month = calendar.monthrange(today.year, today.month)[1]
+        day_of_month = today.day
+        summary["projected_month_end_usage"] = round(
+            (month_usage / day_of_month) * days_in_month, 2
         )
+    except (TypeError, ValueError):
+        summary["projected_month_end_usage"] = None
+    return summary
+
+
+def _format_do_summary_message(title: str, summary: dict) -> str:
+    month_usage = summary.get("month_to_date_usage", "?")
+    account_balance = summary.get("account_balance", "?")
+    month_to_date_balance = summary.get("month_to_date_balance", "?")
+    forecast = summary.get("projected_month_end_usage", "?")
+    return (
+        f"{title} — DigitalOcean\n"
+        f"Gasto del mes en curso: ${month_usage}\n"
+        f"Previsión de gasto a fin de mes: ${forecast}\n"
+        f"Saldo mes a la fecha: ${month_to_date_balance}\n"
+        f"Saldo de la cuenta: ${account_balance}"
+    )
+
+
+async def _send_do_check(context: ContextTypes.DEFAULT_TYPE, title: str) -> None:
+    try:
+        summary = _digitalocean_summary()
+        text = _format_do_summary_message(title, summary)
         await context.bot.send_message(chat_id=int(OWNER_CHAT_ID), text=text)
     except Exception:
-        logger.exception("Error en el chequeo semanal de DigitalOcean")
+        logger.exception("Error en el chequeo de DigitalOcean (%s)", title)
+
+
+async def morning_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_do_check(context, "Aviso de la mañana")
+
+
+async def evening_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_do_check(context, "Aviso de fin de jornada")
 
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -521,11 +558,12 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Chequeo semanal de gasto DO: todos los lunes a las 8:00 UTC
+    # Chequeo diario de gasto DO: 8:00 y 21:00, hora de Barcelona
     if OWNER_CHAT_ID:
-        app.job_queue.run_daily(weekly_do_check, time=dt_time(8, 0), days=(0,))
+        app.job_queue.run_daily(morning_do_check, time=dt_time(8, 0, tzinfo=_LOCAL_TZ))
+        app.job_queue.run_daily(evening_do_check, time=dt_time(21, 0, tzinfo=_LOCAL_TZ))
     else:
-        logger.error("OWNER_CHAT_ID no configurado, chequeo semanal de DigitalOcean desactivado")
+        logger.error("OWNER_CHAT_ID no configurado, chequeos diarios de DigitalOcean desactivados")
 
     logger.info("Bot arrancado. Esperando mensajes...")
     app.run_polling()
