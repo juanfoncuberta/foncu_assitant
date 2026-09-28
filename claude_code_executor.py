@@ -402,26 +402,37 @@ def _fallback_commit(branch_name: str, directory_path: str) -> str | None:
     return None
 
 
-def _checkout_safe(branch: str, directory_path: str) -> None:
+def _checkout_safe(branch: str, directory_path: str) -> str | None:
     """
     Returns to branch. If the repo is dirty (uncommitted changes remain after a failed
-    auto-commit), force-checkout to avoid carrying those changes into the original branch.
+    auto-commit), the changes are stashed first so nothing is lost.
+
+    Returns the stash label if one was created, None otherwise.
     """
     rc, porcelain, _ = _git(["status", "--porcelain"], directory_path)
     is_dirty = rc == 0 and bool(porcelain)
 
+    etiqueta_stash = None
     if is_dirty:
-        # Discard residual changes — they're already captured in the result's git_diff.
-        logger.warning(
-            "Repo sucio al volver a '%s'; descartando cambios sin commit antes del checkout",
-            branch,
-        )
-        rc, _, err = _git(["checkout", "-f", branch], directory_path)
-    else:
-        rc, _, err = _git(["checkout", branch], directory_path)
+        # NO se descarta con `checkout -f`: el git_diff del resultado esta truncado a
+        # 5000 caracteres, asi que un descarte pierde trabajo de verdad. Se guarda en
+        # un stash, que siempre se puede recuperar con `git stash list`.
+        etiqueta_stash = f"foncu-auto: cambios sin commitear al salir de {branch}"
+        rc, _, err = _git(["stash", "push", "-u", "-m", etiqueta_stash], directory_path)
+        if rc != 0:
+            logger.critical(
+                "No se pudo hacer stash en '%s' (%s). NO se cambia de rama: es preferible "
+                "dejar el repo donde esta a destruir los cambios.",
+                branch, err,
+            )
+            return None
+        logger.warning("Cambios sin commitear guardados en stash: %s", etiqueta_stash)
 
+    rc, _, err = _git(["checkout", branch], directory_path)
     if rc != 0:
         logger.critical("No se pudo volver a la rama '%s': %s", branch, err)
+
+    return etiqueta_stash
 
 
 def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
@@ -463,6 +474,7 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
 
     enriched_prompt = task_content + _COMMIT_INSTRUCTIONS
 
+    result: dict = {}
     try:
         result = execute_task(enriched_prompt, directory_path)
         result["branch"] = branch_name
@@ -486,9 +498,38 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
                 if commit_err:
                     logger.error("Fallback commit fallido en '%s': %s", branch_name, commit_err)
                     result["auto_commit_error"] = commit_err
+                    # CLAUDE.md: "la tarea se reporta como fallida con el motivo, nunca
+                    # como hecho a medias". Si parte del trabajo no esta commiteada, no
+                    # hay nada que dar por bueno: el estado del repo no es el que se
+                    # reporta y no se puede revisar ni revertir con fiabilidad.
+                    result["error"] = (
+                        "La tarea NO se puede dar por completada: quedaron cambios sin "
+                        f"commitear y el commit automatico fallo ({commit_err}). Revisa el "
+                        f"estado de la rama '{branch_name}' a mano antes de seguir."
+                    )
+
+            if result.get("auto_commit_error"):
+                # Revisar un arbol a medio commitear daria un informe sobre un estado
+                # que no es el que quedara. Mejor decir que no se reviso.
+                result["review"] = (
+                    "(sin revisar: el commit automatico fallo, el diff no es fiable)"
+                )
+            else:
+                # Compara el diff real contra el plan declarado. Va despues del commit
+                # de fallback para que el diff este completo.
+                result["review"] = _run_reviewer(
+                    task_content, plan, branch_name, original_branch, directory_path
+                )
 
             _save_dev_log(task_content, branch_name, result.get("result") or "", plan=plan)
     finally:
-        _checkout_safe(original_branch, directory_path)
+        etiqueta_stash = _checkout_safe(original_branch, directory_path)
+        if etiqueta_stash and isinstance(result, dict):
+            result["stash"] = etiqueta_stash
+            result["stash_aviso"] = (
+                "El commit automatico fallo y quedaban cambios sin guardar. Estan en un "
+                f"stash de la rama '{branch_name}': recuperalos con `git stash list` y "
+                "`git stash apply`."
+            )
 
     return result
