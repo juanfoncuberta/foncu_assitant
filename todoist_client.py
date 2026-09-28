@@ -72,6 +72,34 @@ def update_task_priority(task_id: str, priority: int) -> dict:
         return _parse_json_object(r)
 
 
+def update_task(
+    task_id: str,
+    content: str | None = None,
+    due_string: str | None = None,
+    priority: int | None = None,
+) -> dict:
+    """
+    Actualiza solo los campos indicados; los que lleguen como None se dejan intactos.
+
+    Ojo con due_string en tareas recurrentes: Todoist reemplaza la regla de
+    recurrencia entera, no solo la proxima fecha.
+    """
+    payload: dict = {}
+    if content is not None:
+        payload["content"] = content
+    if due_string is not None:
+        payload["due_string"] = due_string
+    if priority is not None:
+        payload["priority"] = priority
+    if not payload:
+        raise ValueError("update_task requiere al menos un campo que actualizar")
+
+    with httpx.Client() as client:
+        r = client.post(f"{BASE_URL}/tasks/{task_id}", json=payload, headers=_headers())
+        r.raise_for_status()
+        return _parse_json_object(r)
+
+
 def get_task(task_id: str) -> dict:
     with httpx.Client() as client:
         r = client.get(f"{BASE_URL}/tasks/{task_id}", headers=_headers())

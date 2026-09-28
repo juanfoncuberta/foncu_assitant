@@ -211,12 +211,24 @@ TOOLS = [
         },
     },
     {
-        "name": "actualizar_prioridad",
-        "description": "Actualiza la prioridad de una tarea existente en Todoist.",
+        "name": "actualizar_tarea",
+        "description": (
+            "Actualiza una tarea existente en Todoist. Pasa solo los campos que cambian; "
+            "los que omitas se quedan como están. Ojo: cambiar 'date' en una tarea "
+            "recurrente sustituye su recurrencia."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "ID de la tarea"},
+                "content": {"type": "string", "description": "Nuevo texto de la tarea"},
+                "date": {
+                    "type": "string",
+                    "description": (
+                        "Nueva fecha de vencimiento en lenguaje natural "
+                        "(ej: 'mañana', 'el lunes')"
+                    ),
+                },
                 "priority": {
                     "type": "integer",
                     "description": (
@@ -226,7 +238,7 @@ TOOLS = [
                     "enum": [1, 2, 3, 4],
                 },
             },
-            "required": ["task_id", "priority"],
+            "required": ["task_id"],
         },
     },
     {
@@ -317,17 +329,53 @@ TOOLS = [
         },
     },
     {
-        "name": "eliminar_tarea",
+        "name": "listar_fuentes_contenido",
         "description": (
-            "Elimina permanentemente una tarea de Todoist (borrado real, no completar). "
-            "Esta acción es irreversible. Antes de llamar a esta herramienta, confirma "
-            "siempre con el usuario mostrando el título de la tarea, salvo que ya haya "
-            "sido explícito y específico sobre qué tarea eliminar."
+            "Lista las fuentes de contenido activas (RSS, newsletters, blogs) registradas "
+            "para el agente de LinkedIn/X."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "desactivar_fuente_contenido",
+        "description": (
+            "Desactiva una fuente de contenido por su nombre exacto: deja de consultarse, "
+            "pero no se borra de la base de datos."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "task_id": {"type": "string", "description": "ID de la tarea a eliminar"}
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Nombre exacto de la fuente, tal como aparece en "
+                        "listar_fuentes_contenido"
+                    ),
+                }
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "eliminar_tarea",
+        "description": (
+            "Elimina permanentemente una tarea de Todoist (borrado real, no completar). "
+            "Esta acción es irreversible. Llamada sin force_delete, devuelve "
+            "{requires_confirmation: true} junto al título de la tarea, sin borrar nada; "
+            "en ese caso muestra el título al usuario, pide confirmación explícita y solo "
+            "entonces vuelve a llamar con force_delete: true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "ID de la tarea a eliminar"},
+                "force_delete": {
+                    "type": "boolean",
+                    "description": (
+                        "Si es true, borra sin pedir confirmación. Usar solo tras una "
+                        "respuesta afirmativa explícita del usuario al aviso previo."
+                    ),
+                },
             },
             "required": ["task_id"],
         },
@@ -405,27 +453,70 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
         project_id = provider.resolve_project(project)["id"] if project else get_project_id(chat_id, thread_id)
         return provider.list_tasks(project_id=project_id)
 
-    if name == "actualizar_prioridad":
-        return provider.update_task_priority(tool_input["task_id"], tool_input["priority"])
+    if name == "actualizar_tarea":
+        campos = {
+            clave: tool_input[clave]
+            for clave in ("content", "date", "priority")
+            if tool_input.get(clave) is not None
+        }
+        if not campos:
+            return {"error": "No se indicó ningún campo que actualizar."}
+        return provider.update_task(
+            tool_input["task_id"],
+            content=campos.get("content"),
+            due_string=campos.get("date"),
+            priority=campos.get("priority"),
+        )
 
     if name == "completar_tarea":
         provider.close_task(tool_input["task_id"])
         return {"status": "completada"}
 
     if name == "eliminar_tarea":
-        provider.delete_task(tool_input["task_id"])
+        task_id = tool_input["task_id"]
+        if not tool_input.get("force_delete", False):
+            try:
+                task_content = todoist_client.get_task(task_id).get("content", "")
+            except Exception:
+                logger.exception("No se pudo leer la tarea %s antes de borrarla", task_id)
+                task_content = "(no se pudo leer el titulo de la tarea)"
+            return {
+                "requires_confirmation": True,
+                "reason": "El borrado de una tarea es irreversible.",
+                "task_id": task_id,
+                "task_content": task_content,
+            }
+        provider.delete_task(task_id)
         return {"status": "eliminada"}
 
     if name == "anadir_fuente_contenido":
         return add_content_source(tool_input["name"], tool_input["url"], tool_input["type"])
 
+    if name == "listar_fuentes_contenido":
+        return list_content_sources()
+
+    if name == "desactivar_fuente_contenido":
+        return deactivate_content_source(tool_input["name"])
+
     if name == "vincular_carpeta_proyecto":
-        set_project_directory(tool_input["project_id"], tool_input["directory_path"])
-        return {
+        directory_path = tool_input["directory_path"]
+        rechazo = _validate_project_directory(directory_path)
+        if rechazo:
+            return {"error": rechazo}
+
+        set_project_directory(tool_input["project_id"], directory_path)
+        respuesta = {
             "status": "ok",
             "project_id": tool_input["project_id"],
-            "directory_path": tool_input["directory_path"],
+            "directory_path": directory_path,
         }
+        if not os.path.isdir(os.path.join(os.path.realpath(directory_path), ".git")):
+            respuesta["aviso"] = (
+                "La carpeta no es un repositorio Git. Se ha vinculado igualmente, pero "
+                "ejecutar_tarea_dev pedira confirmacion explicita cada vez, porque sin "
+                "Git no hay forma de revertir los cambios."
+            )
+        return respuesta
 
     if name == "ejecutar_tarea_dev":
         task = todoist_client.get_task(tool_input["task_id"])

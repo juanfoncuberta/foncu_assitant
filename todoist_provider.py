@@ -19,6 +19,15 @@ class TodoistProvider(TaskProvider):
     def update_task_priority(self, task_id: str, priority: int) -> dict:
         return todoist_client.update_task_priority(task_id, priority)
 
+    def update_task(
+        self,
+        task_id: str,
+        content: str | None = None,
+        due_string: str | None = None,
+        priority: int | None = None,
+    ) -> dict:
+        return todoist_client.update_task(task_id, content, due_string, priority)
+
     def close_task(self, task_id: str) -> None:
         todoist_client.close_task(task_id)
 

@@ -19,6 +19,15 @@ class TaskProvider(ABC):
     def update_task_priority(self, task_id: str, priority: int) -> dict: ...
 
     @abstractmethod
+    def update_task(
+        self,
+        task_id: str,
+        content: str | None = None,
+        due_string: str | None = None,
+        priority: int | None = None,
+    ) -> dict: ...
+
+    @abstractmethod
     def close_task(self, task_id: str) -> None: ...
 
     @abstractmethod
