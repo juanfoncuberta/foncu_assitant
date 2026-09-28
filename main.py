@@ -3,15 +3,19 @@ Asistente personal — Milestone 2
 Telegram <-> Claude <-> Todoist, con Topics de Telegram mapeados a proyectos.
 """
 
+import asyncio
 import calendar
 import json
 import logging
 import os
+import re
 import threading
+import time
 from datetime import date, time as dt_time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
 import uvicorn
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -41,9 +45,166 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _validar_entorno() -> None:
+    """
+    Comprueba al arrancar que las variables criticas existen y tienen la forma esperada.
+
+    Fallar aqui es barato: lo ves en el despliegue. Fallar dentro de un job nocturno
+    envuelto en un try/except que solo loguea no se entera nadie — que es exactamente
+    lo que paso con OWNER_CHAT_ID, que estuvo semanas con el token del bot dentro
+    mientras int() reventaba en silencio cada noche.
+    """
+    errores: list[str] = []
+    avisos: list[str] = []
+
+    for clave in ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "TODOIST_API_TOKEN"):
+        if not os.environ.get(clave, "").strip():
+            errores.append(f"{clave} no esta definida o esta vacia.")
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if token and not re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", token):
+        errores.append(
+            "TELEGRAM_BOT_TOKEN no tiene forma de token de Telegram "
+            "(se espera '<numero>:<cadena>')."
+        )
+
+    owner = os.environ.get("OWNER_CHAT_ID", "").strip()
+    if not owner:
+        errores.append(
+            "OWNER_CHAT_ID no esta definida. Sin ella no hay avisos proactivos."
+        )
+    elif not re.fullmatch(r"-?\d+", owner):
+        pista = (
+            " Empieza por un numero seguido de ':', asi que te has dejado ahi el token "
+            "del bot en vez del chat ID."
+            if ":" in owner
+            else ""
+        )
+        errores.append(
+            f"OWNER_CHAT_ID debe ser un entero pelado y vale {owner[:14]!r}.{pista}"
+        )
+
+    for clave, para_que in (
+        ("DIGITALOCEAN_TOKEN", "los chequeos de gasto"),
+        ("INTERNAL_API_KEY", "la API interna en el puerto 8001"),
+    ):
+        if not os.environ.get(clave, "").strip():
+            avisos.append(f"{clave} no esta definida: {para_que} no funcionaran.")
+
+    for aviso in avisos:
+        logger.warning("Configuracion: %s", aviso)
+
+    if errores:
+        raise RuntimeError(
+            "Configuracion invalida en .env — el bot no arranca:\n  - "
+            + "\n  - ".join(errores)
+        )
+
+
+_validar_entorno()
+
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")
+
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+
+
+def _alerta_externa(asunto: str, detalle: str) -> None:
+    """
+    Canal de aviso INDEPENDIENTE de Telegram.
+
+    Existe para un caso concreto: cuando lo que falla es el propio Telegram
+    (OWNER_CHAT_ID mal configurado, bot bloqueado, chat inexistente), avisar por
+    Telegram es imposible por definicion. Y un log no sirve de nada si nadie lo mira
+    a diario.
+
+    Apunta ALERT_WEBHOOK_URL a cualquier cosa que acepte un POST con JSON: el n8n que
+    ya corre en el droplet (y desde ahi email, o lo que sea), Slack, Discord, etc.
+    Asi el bot no necesita credenciales de correo ni saber como se entrega el aviso.
+
+    Nunca lanza excepcion: un fallo avisando no puede tumbar lo que estaba avisando.
+    """
+    if not ALERT_WEBHOOK_URL:
+        logger.error(
+            "ALERTA SIN CANAL DE SALIDA (%s): %s -- configura ALERT_WEBHOOK_URL en el "
+            ".env para recibir esto fuera de Telegram.",
+            asunto, detalle,
+        )
+        return
+
+    try:
+        httpx.post(
+            ALERT_WEBHOOK_URL,
+            json={
+                "origen": "foncu_assistant",
+                "severidad": "critical",
+                "asunto": asunto,
+                "detalle": detalle,
+            },
+            timeout=10,
+        )
+        logger.info("Alerta externa enviada: %s", asunto)
+    except Exception:
+        logger.exception("No se pudo enviar la alerta externa: %s", asunto)
+
+
+def _cargar_chats_autorizados() -> set[int]:
+    """
+    Chats que pueden hablar con el bot.
+
+    Sin esto cualquiera que de con el @username del bot (son publicos por diseno)
+    tiene acceso completo a Todoist, al gasto de DigitalOcean y, encadenando
+    vincular_carpeta_proyecto con ejecutar_tarea_dev, a ejecutar codigo en el droplet.
+
+    Por defecto solo el duenyo. ALLOWED_CHAT_IDS permite anadir mas (separados por
+    comas) si algun dia el bot vive en un grupo.
+    """
+    raw = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
+    if raw:
+        return {int(c.strip()) for c in raw.split(",") if c.strip()}
+    return {int(OWNER_CHAT_ID)} if OWNER_CHAT_ID else set()
+
+
+_CHATS_AUTORIZADOS = _cargar_chats_autorizados()
+
+
+def _autorizado(chat_id: int) -> bool:
+    return chat_id in _CHATS_AUTORIZADOS
+
+
+# Un desconocido insistiendo no debe convertirse en una lluvia de notificaciones
+# (ni en una factura de Telegram): se avisa una vez por chat_id y hora.
+_RECHAZOS_AVISADOS: dict[int, float] = {}
+_INTERVALO_AVISO_RECHAZO = 3600  # segundos
+
+
+def _debe_avisar_de_rechazo(chat_id: int) -> bool:
+    ahora = time.monotonic()
+    ultimo = _RECHAZOS_AVISADOS.get(chat_id)
+    if ultimo is not None and ahora - ultimo < _INTERVALO_AVISO_RECHAZO:
+        return False
+    _RECHAZOS_AVISADOS[chat_id] = ahora
+    return True
+
+
+async def _avisar_acceso_rechazado(context, chat_id: int, texto: str) -> None:
+    """Notifica al duenyo que alguien no autorizado ha escrito al bot."""
+    if not OWNER_CHAT_ID or not _debe_avisar_de_rechazo(chat_id):
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=int(OWNER_CHAT_ID),
+            text=(
+                "Acceso rechazado\n"
+                f"chat_id: {chat_id}\n"
+                f"Mensaje: {texto[:200]}\n\n"
+                "Si eres tu, ALLOWED_CHAT_IDS o OWNER_CHAT_ID estan mal en el .env."
+            ),
+        )
+    except Exception:
+        logger.exception("No se pudo avisar del acceso rechazado de %s", chat_id)
+
 
 _LOCAL_TZ = ZoneInfo("Europe/Madrid")
 
@@ -116,24 +277,38 @@ saldo o factura del mes en curso."""
 
 
 def _load_capabilities() -> str:
+    """
+    Carga las reglas de autonomia del agente.
+
+    Falla CERRADO a proposito: si este archivo no se puede leer, el bot arrancaria
+    sin ninguna regla de nivel 1/2/3 y seguiria contestando con normalidad, asi que
+    nadie se enteraria de que las confirmaciones han desaparecido. Un componente de
+    seguridad que se degrada en silencio es peor que no tenerlo.
+    """
     capabilities_path = os.path.join(os.path.dirname(__file__), "AGENT_CAPABILITIES.md")
     try:
         with open(capabilities_path, encoding="utf-8") as f:
-            return f.read()
-    except Exception as exc:
-        logger.error("No se pudo leer AGENT_CAPABILITIES.md: %s", exc)
-        return ""
+            contenido = f.read().strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"No se pudo leer {capabilities_path}: {exc}. "
+            "El bot no arranca sin sus reglas de autonomia."
+        ) from exc
+
+    if "Nivel 3" not in contenido:
+        raise RuntimeError(
+            f"{capabilities_path} no contiene la seccion 'Nivel 3'. "
+            "Parece truncado o vacio; el bot no arranca sin sus reglas de autonomia."
+        )
+
+    return contenido
 
 
-_capabilities = _load_capabilities()
-if _capabilities:
-    SYSTEM_PROMPT = (
-        _BASE_SYSTEM_PROMPT
-        + "\n\n---\nEstas son tus reglas de capacidades y niveles de autonomía, síguelas estrictamente:\n\n"
-        + _capabilities
-    )
-else:
-    SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT
+SYSTEM_PROMPT = (
+    _BASE_SYSTEM_PROMPT
+    + "\n\n---\nEstas son tus reglas de capacidades y niveles de autonomía, síguelas estrictamente:\n\n"
+    + _load_capabilities()
+)
 
 TOOLS = [
     {
@@ -591,8 +766,12 @@ async def _send_do_check(context: ContextTypes.DEFAULT_TYPE, title: str) -> None
         summary = _digitalocean_summary()
         text = _format_do_summary_message(title, summary)
         await context.bot.send_message(chat_id=int(OWNER_CHAT_ID), text=text)
-    except Exception:
+    except Exception as exc:
         logger.exception("Error en el chequeo de DigitalOcean (%s)", title)
+        _alerta_externa(
+            f"Fallo el chequeo de gasto ({title})",
+            f"No se pudo completar ni enviar el aviso de DigitalOcean: {exc}",
+        )
 
 
 async def morning_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -606,6 +785,11 @@ async def evening_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     thread_id = update.message.message_thread_id
+
+    if not _autorizado(chat_id):
+        logger.warning("/reset rechazado: chat_id no autorizado (%s)", chat_id)
+        return
+
     reset_topic(chat_id, thread_id)
     logger.info("Historial borrado (chat=%s thread=%s)", chat_id, thread_id)
     await update.message.reply_text("Contexto borrado. Empezamos de cero.", message_thread_id=thread_id)
@@ -615,6 +799,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_text = update.message.text
     chat_id = update.message.chat_id
     thread_id = update.message.message_thread_id
+
+    if not _autorizado(chat_id):
+        # Al desconocido no se le contesta (confirmaria que el bot existe), pero al
+        # duenyo si se le avisa: si el .env tuviera el chat_id mal, este seria el
+        # unico sintoma visible de que te has dejado fuera a ti mismo.
+        logger.warning(
+            "Mensaje rechazado: chat_id no autorizado (%s). Texto: %.80s", chat_id, user_text
+        )
+        await _avisar_acceso_rechazado(context, chat_id, user_text or "")
+        return
 
     logger.info("Mensaje recibido (chat=%s thread=%s): %s", chat_id, thread_id, user_text)
 
@@ -676,6 +870,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         add_semantic_memory(chat_id, thread_id, "user", user_text)
         add_semantic_memory(chat_id, thread_id, "assistant", reply_text)
         trim_and_summarize(chat_id, thread_id, claude)
+
+
+async def _saludo_de_arranque(app) -> None:
+    """
+    Comprueba contra la API de Telegram que OWNER_CHAT_ID es un chat real y alcanzable,
+    y manda un mensaje de arranque.
+
+    _validar_entorno() ya garantiza que es un entero, pero un entero puede ser
+    perfectamente valido y aun asi no ser tu chat. Este es el unico momento en el que
+    ese error se puede detectar antes de que te deje fuera del bot.
+    """
+    if not OWNER_CHAT_ID:
+        return
+    try:
+        chat = await app.bot.get_chat(int(OWNER_CHAT_ID))
+        logger.info("OWNER_CHAT_ID verificado: %s (%s)", OWNER_CHAT_ID, chat.type)
+        await app.bot.send_message(
+            chat_id=int(OWNER_CHAT_ID),
+            text=f"Bot arrancado. Chats autorizados: {sorted(_CHATS_AUTORIZADOS)}",
+        )
+    except Exception as exc:
+        logger.critical(
+            "OWNER_CHAT_ID=%s no es un chat alcanzable. El bot sigue en pie, pero "
+            "revisa el .env: es muy probable que no puedas hablarle.",
+            OWNER_CHAT_ID,
+        )
+        # No se puede avisar por Telegram de que Telegram esta mal configurado.
+        _alerta_externa(
+            "OWNER_CHAT_ID no alcanzable",
+            f"El bot arranco pero no puede escribir a OWNER_CHAT_ID={OWNER_CHAT_ID}. "
+            f"Error: {exc}. Revisa el .env del droplet: probablemente no puedas "
+            "hablarle al bot ni recibir los avisos de gasto.",
+        )
 
 
 def main() -> None:
