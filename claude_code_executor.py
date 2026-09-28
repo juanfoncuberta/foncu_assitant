@@ -310,6 +310,87 @@ def _get_plan(task_content: str, directory_path: str) -> str:
     return (data.get("result") or "").strip() or "(plan vacío)"
 
 
+REVIEW_TIMEOUT_SECONDS = 240
+
+_REVIEW_PROMPT_TEMPLATE = """Use the `reviewer` subagent to audit the work that was just \
+completed on branch `{branch}`, comparing the real diff against the plan declared beforehand.
+
+Declared plan:
+{plan}
+
+Original task:
+{task_content}
+
+The changes are the diff between `{original_branch}` and `{branch}` \
+(`git diff {original_branch}..{branch}`).
+
+Return the reviewer's report verbatim. Do not fix anything, do not add your own commentary, \
+and do not approve or reject the task — that decision belongs to a human."""
+
+
+def _run_reviewer(
+    task_content: str,
+    plan: str,
+    branch_name: str,
+    original_branch: str,
+    directory_path: str,
+) -> str:
+    """
+    Read-only review pass: hands the declared plan and the resulting diff to the `reviewer`
+    subagent, which looks for scope creep, unrequested production rewrites and protected
+    files touched.
+
+    Detection, not prevention — this runs after the fact. It never blocks the flow and never
+    raises: any failure comes back as a note in the returned string, because a review that
+    could not run must be visible rather than silently absent.
+
+    Disabled by setting REVIEWER_ENABLED=false (it costs a third claude -p call per task).
+    """
+    if os.environ.get("REVIEWER_ENABLED", "true").strip().lower() in {"0", "false", "no"}:
+        return "(revisión desactivada por configuración: REVIEWER_ENABLED)"
+
+    prompt = _REVIEW_PROMPT_TEMPLATE.format(
+        branch=branch_name,
+        plan=plan,
+        task_content=task_content,
+        original_branch=original_branch,
+    )
+
+    try:
+        proc = subprocess.run(
+            [
+                "claude",
+                "-p", prompt,
+                "--output-format", "json",
+                "--disallowedTools", "Edit,Write",
+                "--add-dir", directory_path,
+                *_flags_modelo(REVIEW_MODEL),
+            ],
+            cwd=directory_path,
+            capture_output=True,
+            text=True,
+            timeout=REVIEW_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("La revisión posterior superó %ds", REVIEW_TIMEOUT_SECONDS)
+        return f"(la revisión no terminó en {REVIEW_TIMEOUT_SECONDS}s — revisa el diff a mano)"
+    except Exception:
+        logger.exception("Fallo al lanzar la revisión posterior")
+        return "(no se pudo ejecutar la revisión — revisa el diff a mano)"
+
+    if proc.returncode != 0:
+        logger.warning("Revisión: claude -p exited %d", proc.returncode)
+        return "(la revisión falló — revisa el diff a mano)"
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.warning("Revisión: salida no-JSON de claude -p")
+        return "(la revisión devolvió una salida ilegible — revisa el diff a mano)"
+
+    return (data.get("result") or "").strip() or "(la revisión no devolvió nada)"
+
+
 _FIX_WORDS = {
     "fix", "bug", "error", "broken", "crash", "patch",
     "arregla", "arreglar", "corrige", "corregir", "falla", "repara", "reparar",
@@ -445,6 +526,8 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
       branch            — name of the created branch
       plan              — plan described by a read-only claude -p call before any change,
                            made for the reviewer subagent to compare against the real diff
+      review            — report from the `reviewer` subagent comparing that plan against
+                           the real diff (scope creep, unrequested rewrites, protected files)
       auto_commit_error — present only if the fallback commit step was needed and failed
     """
     rc, original_branch, err = _git(["rev-parse", "--abbrev-ref", "HEAD"], directory_path)
