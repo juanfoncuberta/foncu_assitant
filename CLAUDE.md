@@ -1,13 +1,21 @@
 # CLAUDE.md
 
+Reglas permanentes para Claude Code trabajando en este repositorio.
+Aplican en cualquier sesión, sea cual sea la tarea.
+
+Si necesitas saber **dónde** va una regla nueva, o cómo se relacionan el bot y
+Claude Code, lee `docs/agent-architecture.md` antes de escribir nada aquí.
+
 ## Commit messages
 
-- **Subject line**: ≤ ~72 characters; one imperative phrase summarising the change
-  (e.g. `add tests for claude_code_executor edge cases`, not a list of modules).
-- **Body**: only when it adds something the diff cannot show — the *why* behind
-  a non-obvious decision. Most commits need no body.
-- Never list module-by-module what changed; that is already visible in
-  `git diff` / `git show`.
+- **Asunto (primera línea del mensaje)**: máximo 72 caracteres, en inglés, modo
+  imperativo y en minúsculas. Una sola frase que resuma el cambio
+  (ej. `add tests for claude_code_executor edge cases`, nunca una lista de módulos).
+- **Cuerpo**: solo cuando aporte algo que el diff no muestra — el *porqué* de una
+  decisión no obvia. La mayoría de commits no necesitan cuerpo.
+- Nunca enumeres módulo por módulo qué cambió; eso ya se ve en `git diff` / `git show`.
+- Sin firmas de ningún tipo (`Co-authored-by`, `Generated with`, etc.). Ya están
+  desactivadas en `.claude/settings.json`; no las añadas a mano.
 
 ## Reglas de arquitectura (no negociables)
 
@@ -21,19 +29,76 @@
   directamente — pasan por los módulos `*_client.py` / `*_provider.py`.
 - Los secretos viven solo en `.env`, nunca en código ni en commits.
 
+## Archivos protegidos
+
+Nunca edites estos archivos, ni siquiera como paso intermedio, sin aprobación
+humana explícita:
+
+`.env` · `docker-compose.yml` · `Dockerfile` · `deploy.sh` · cualquier archivo
+bajo `.claude/` · cualquier migración de base de datos.
+
+Un hook `PreToolUse` bloquea las escrituras sobre estas rutas, así que un intento
+fallará con un error. Si una tarea parece necesitar tocarlas, detente y repórtalo
+en tu resumen final en vez de buscar una vía alternativa.
+
+## Tests
+
+Todo cambio en lógica de negocio lleva su test **en el mismo commit**. Que la suite
+pase en verde no basta: una suite sin tests de lo que acabas de tocar pasa
+perfectamente y no prueba nada.
+
+Concretamente, llevan test obligatorio:
+
+- Una tool nueva o un cambio en su comportamiento (`execute_tool` en `main.py`).
+- Cualquier validación, confirmación o límite — es decir, todo lo que exista para
+  impedir algo.
+- Cualquier corrección de bug: primero el test que lo reproduce, luego el arreglo.
+
+No lo llevan: cambios de documentación, de formato, o de comentarios.
+
+Si un módulo no se puede testear sin montar medio sistema, eso es el hallazgo —
+repórtalo en tu resumen final en vez de saltarte el test.
+
 ## Verificación obligatoria
 
 Una tarea no está completa hasta que:
 
 1. `pytest` pasa en su totalidad (no solo los tests nuevos que haya añadido la tarea).
+   El hook `PostToolUse` ya ejecuta la suite rápida tras cada edición; basta con
+   leer su salida, no hace falta relanzarla a mano salvo que quieras incluir los
+   tests marcados como `integration`.
 2. Cualquier archivo modificado fuera del alcance declarado para la tarea se
    reporta explícitamente — nunca se pasa por alto en silencio.
 
 Si algo de esto falla, la tarea se reporta como fallida con el motivo — nunca
 como "hecho" a medias.
 
-## Límite de reintentos
+## Reintentos
 
-Máximo 2 reintentos automáticos por tarea. Si el mismo tipo de fallo se repite
-(mismo error, mismo archivo), se detiene y se reporta — nunca se queda
-reintentando en bucle.
+Si un mismo comando o test falla dos veces con el mismo error, no lo intentes una
+tercera vez. Detente y explica en tu resumen final qué fallaba, qué probaste y
+cuál crees que es la causa. Nunca te quedes reintentando en bucle.
+
+## Permisos dentro de `ejecutar_tarea_dev`
+
+Esta sección aplica cuando `claude_code_executor.py` te invoca en modo headless
+para ejecutar una tarea de Todoist.
+
+El executor ya garantiza por su cuenta:
+
+- La llamada de planificación (`_get_plan`) se lanza con
+  `--disallowedTools Edit,Write,Bash` — es de solo lectura por obligación.
+- El plan se pide **siempre**, para cualquier tarea, y se guarda en `dev_log.plan`.
+- La ejecución ocurre en una rama nueva, nunca sobre la rama original.
+
+Lo que se espera de ti según el tipo de tarea:
+
+| Tipo de tarea | Comportamiento esperado |
+|---|---|
+| Consulta / lectura (sin cambios de código) | No edites nada. Responde y termina |
+| Cambio acotado con tests (caso normal) | Cíñete a los archivos del plan. Añade o ajusta tests. `Bash` solo para `pytest`, lint y git |
+| Cambio estructural (varios módulos) | Igual, pero si el plan declarado se queda corto, para y repórtalo antes de ampliar el alcance por tu cuenta |
+
+Al terminar, tu resumen final debe incluir qué problema resolvías, qué cambiaste
+y por qué ese enfoque lo resuelve. El executor añade por su cuenta el diff, el
+coste y el `session_id`.

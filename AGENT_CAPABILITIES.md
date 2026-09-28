@@ -5,6 +5,11 @@ y cuáles necesitan confirmación explícita previa. **Regla de oro:** la lista 
 en el código para cada agente debe coincidir exactamente con lo que este documento autoriza.
 Si una acción no aparece aquí como permitida, el agente no debe tener esa función disponible.
 
+Este archivo se carga en el system prompt del bot (`main.py`, `_load_capabilities()`),
+así que todo lo que contenga se envía en cada mensaje. Las reglas que gobiernan a
+Claude Code dentro de `ejecutar_tarea_dev` NO van aquí — van en `CLAUDE.md`, que es
+lo que Claude Code carga.
+
 Estos niveles son propios de **foncu_assistant** como sistema, no de un canal concreto.
 Hoy el único cliente es el bot de Telegram, pero si el día de mañana se conecta otro
 cliente (web, WhatsApp, etc.) contra el mismo backend, hereda estos mismos niveles sin
@@ -23,9 +28,13 @@ al usuario antes ni después, salvo que el resultado en sí sea la respuesta esp
 | `vincular_proyecto` | Crea o vincula un proyecto Todoist al topic actual       |
 | `crear_tarea`       | Escribe en Todoist; fácilmente reversible                |
 | `listar_tareas`     | Solo lectura                                             |
-| `actualizar_prioridad` | Cambio menor, reversible                              |
+| `actualizar_tarea`  | Cambia texto, fecha o prioridad; reversible              |
 | `completar_tarea`   | Reversible (se puede descompletar)                       |
 | `web_search`        | Solo lectura, sin riesgo                                 |
+| `anadir_fuente_contenido` | Escribe una fuente de contenido; reversible a mano |
+| `listar_fuentes_contenido` | Solo lectura                                        |
+| `desactivar_fuente_contenido` | Marca una fuente como inactiva; reversible      |
+| `consultar_gasto_digitalocean` | Solo lectura sobre la API de DigitalOcean   |
 
 ---
 
@@ -36,9 +45,11 @@ El agente ejecuta sin pedir permiso previo, pero **siempre** informa del resulta
 | Acción               | Condición para ejecución autónoma                                      |
 |----------------------|------------------------------------------------------------------------|
 | `ejecutar_tarea_dev` | **Solo** cuando `directory_path` es un repositorio Git **Y** el árbol de trabajo está limpio (sin cambios sin commitear) antes de empezar |
+| `vincular_carpeta_proyecto` | Asocia una carpeta del servidor a un proyecto. No modifica nada por sí sola, pero determina dónde se ejecutará Claude Code después — por eso se valida contra `ALLOWED_PROJECT_ROOTS` y se informa siempre de qué carpeta quedó vinculada |
 
 **Aviso posterior obligatorio incluye:** resultado de la ejecución, diff generado (git diff),
-coste en USD y session_id. La tarea de Todoist **nunca** se marca como completada
+coste en USD, session_id y el informe del subagent `reviewer`, que compara el diff real
+contra el plan declarado antes de empezar. La tarea de Todoist **nunca** se marca como completada
 automáticamente — esa decisión la toma el usuario.
 
 ---
@@ -51,10 +62,15 @@ automáticamente — esa decisión la toma el usuario.
 | `ejecutar_tarea_dev`        | Cuando `directory_path` **no** es un repo Git, o tiene cambios sin commitear — no hay red de seguridad para revertir |
 | Publicación externa (futuro) | LinkedIn, X u otras plataformas públicas, cuando se implementen    |
 
-Para `ejecutar_tarea_dev` en este caso, el agente debe:
-1. Mostrar el contenido de la tarea y la carpeta donde se ejecutará.
-2. Preguntar: "Voy a ejecutar la tarea X en la carpeta Y. ¿Confirmas?"
-3. Solo proceder tras respuesta afirmativa explícita del usuario.
+En ambos casos la confirmación no depende de que el modelo se acuerde de pedirla:
+la tool devuelve `{requires_confirmation: true}` sin ejecutar nada, y solo actúa
+cuando se la vuelve a llamar con el flag de confirmación (`force_execute` /
+`force_delete`) tras una respuesta afirmativa explícita del usuario.
+
+El agente debe, en ese primer paso:
+1. Mostrar qué se va a hacer y sobre qué (título de la tarea, o tarea + carpeta).
+2. Preguntar explícitamente si se confirma.
+3. Solo entonces llamar de nuevo con el flag.
 
 ---
 
@@ -64,24 +80,5 @@ Para `ejecutar_tarea_dev` en este caso, el agente debe:
 > con lo que este documento autoriza. Si una acción no está aquí como permitida, el agente
 > no debe tener esa función disponible para llamar.
 
----
-
-## Permisos de Claude Code dentro de `ejecutar_tarea_dev`
-
-Los niveles de arriba gobiernan qué puede llamar foncu_assistant por su cuenta, sin importar qué cliente (Telegram u otro futuro) haya originado la petición.
-Esta sección es distinta: gobierna qué puede hacer **Claude Code** una vez que
-`claude_code_executor.py` lo invoca en modo headless para una tarea concreta.
-
-Hoy `execute_task()` lanza `claude` con `--permission-mode acceptEdits` pero sin
-ningún `--allowedTools` — es decir, no hay restricción real de herramientas todavía.
-La tabla siguiente es el objetivo a implementar (ver tarea de allowlist explícito):
-
-| Tipo de tarea                          | Tools permitidas                                                     |
-|-----------------------------------------|------------------------------------------------------------------------|
-| Consulta / lectura (sin cambios de código) | `Read`, `Glob`, `Grep` — sin `Edit`/`Write`, sin `Bash` de escritura |
-| Cambio acotado con tests (caso normal)  | `Read`, `Glob`, `Grep`, `Edit`, `Write`, `Bash` limitado a `pytest`/lint, siempre en una rama nueva |
-| Cambio estructural (varios módulos)    | Igual que el anterior + requiere que se haya declarado un plan (archivos a tocar y cambio en cada uno) antes de ejecutar |
-
-**Archivos prohibidos para cualquier tipo de tarea, sin aprobación manual explícita:**
-`.env`, `docker-compose.yml`, `Dockerfile`, `deploy.sh`, cualquier archivo bajo `.claude/`,
-y cualquier migración de base de datos.
+Al añadir una tool nueva a `TOOLS` en `main.py`, añádela también a la tabla del nivel
+que le corresponda en el mismo commit.
