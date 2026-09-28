@@ -829,7 +829,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     messages: list[dict] = history + [{"role": "user", "content": user_text}]
 
     while True:
-        response = claude.messages.create(
+        # to_thread: el cliente de Anthropic es sincrono. Llamarlo directo desde un
+        # handler async congela el event loop entero — el bot deja de responder a
+        # todo el mundo mientras espera.
+        response = await asyncio.to_thread(
+            claude.messages.create,
             model="claude-sonnet-4-6",
             max_tokens=1024,
             system=system,
@@ -845,8 +849,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if block.type != "tool_use":
                 continue
             logger.info("Tool use: %s %s", block.name, block.input)
+
+            if block.name == "ejecutar_tarea_dev" and not block.input.get("force_execute"):
+                await update.message.reply_text(
+                    "Arrancando la tarea de desarrollo. Puede tardar varios minutos "
+                    "(plan, ejecución y revisión); te aviso al terminar.",
+                    message_thread_id=thread_id,
+                )
+
             try:
-                result = execute_tool(block.name, block.input, chat_id, thread_id)
+                # Igual que arriba: execute_tool es sincrono y ejecutar_tarea_dev
+                # puede tardar minutos lanzando claude -p tres veces.
+                result = await asyncio.to_thread(
+                    execute_tool, block.name, block.input, chat_id, thread_id
+                )
             except Exception as exc:
                 logger.exception("Error ejecutando herramienta %s", block.name)
                 result = {"error": str(exc)}
