@@ -343,6 +343,44 @@ TOOLS = [
 ]
 
 
+_DEFAULT_PROJECT_ROOTS = "/opt"
+
+
+def _allowed_project_roots() -> list[str]:
+    """Raices bajo las que se permite vincular carpetas de proyecto."""
+    raw = os.environ.get("ALLOWED_PROJECT_ROOTS", _DEFAULT_PROJECT_ROOTS)
+    return [os.path.abspath(r.strip()) for r in raw.split(",") if r.strip()]
+
+
+def _validate_project_directory(directory_path: str) -> str | None:
+    """
+    Comprueba que una carpeta puede vincularse a un proyecto.
+    Devuelve el motivo del rechazo, o None si es valida.
+
+    Esta carpeta determina donde se ejecutara Claude Code mas adelante, asi que
+    se valida aqui y no en el momento de ejecutar: un fallo en este punto es
+    barato, y uno en ejecutar_tarea_dev ya no.
+    """
+    if not directory_path or not os.path.isabs(directory_path):
+        return "La ruta debe ser absoluta (empezar por '/')."
+
+    # realpath resuelve symlinks y '..', para que no se pueda escapar de la raiz.
+    real = os.path.realpath(directory_path)
+
+    if not os.path.isdir(real):
+        return f"'{directory_path}' no existe o no es una carpeta."
+
+    roots = _allowed_project_roots()
+    if not any(real == root or real.startswith(root + os.sep) for root in roots):
+        return (
+            f"'{directory_path}' esta fuera de las raices permitidas "
+            f"({', '.join(roots)}). Si la carpeta es legitima, anadela a "
+            "ALLOWED_PROJECT_ROOTS en el .env."
+        )
+
+    return None
+
+
 def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id: int | None) -> Any:
     if name == "vincular_proyecto":
         project = provider.resolve_project(tool_input["project_name"])
