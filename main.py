@@ -23,11 +23,15 @@ import internal_api
 import provider_factory
 import todoist_client
 from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
-from content_sources import add_source as add_content_source
+from content_sources import (
+    add_source as add_content_source,
+    deactivate_source as deactivate_content_source,
+    list_active_sources as list_content_sources,
+)
 from conversation_memory import add_message, get_history, get_summary, reset_topic, trim_and_summarize
 from project_directory_map import get_directory as get_project_directory, set_directory as set_project_directory
 from project_map import get_project_id, set_project_id
-from semantic_memory import add_semantic_memory, search_similar
+from semantic_memory import add_semantic_memory, search_similar, warmup as warmup_embeddings
 
 load_dotenv()
 
@@ -554,7 +558,12 @@ def main() -> None:
     api_thread.start()
     logger.info("Internal API listening on port 8001")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # El modelo de embeddings se carga perezosamente para que importar este modulo
+    # sea barato (y testeable). Se precalienta aqui, en segundo plano, para que el
+    # primer mensaje no pague los ~20s de carga.
+    threading.Thread(target=warmup_embeddings, daemon=True).start()
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_saludo_de_arranque).build()
     app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

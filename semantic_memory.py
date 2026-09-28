@@ -2,18 +2,15 @@
 Semantic memory layer — embeddings stored in assistant.db alongside the
 chronological history, enabling similarity-based recall across conversations.
 
-The SentenceTransformer model is loaded once at module import time so it is
-ready before the first message arrives.
+El modelo de SentenceTransformer se carga perezosamente (ver _get_model), y main()
+lo precalienta en un hilo aparte para que el import del modulo siga siendo barato.
 """
 
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
-
-import numpy as np
-import sqlite_vec
-from sentence_transformers import SentenceTransformer
 
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 _NONE_SENTINEL = 0
@@ -91,7 +88,9 @@ def _key(topic_id: int | None) -> int:
 
 
 def _embed(text: str) -> bytes:
-    return _model.encode(text, normalize_embeddings=True).astype(np.float32).tobytes()
+    import numpy as np
+
+    return _get_model().encode(text, normalize_embeddings=True).astype(np.float32).tobytes()
 
 
 def add_semantic_memory(chat_id: int, topic_id: int | None, role: str, content: str) -> None:
