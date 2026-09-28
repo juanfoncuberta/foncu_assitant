@@ -524,3 +524,67 @@ class TestExecuteTaskOnBranchDevLog:
         mocker.patch("subprocess.run", side_effect=_branch_exec_calls(claude_rc=1))
         ce.execute_task_on_branch("add feature", "/path")
         assert ce.get_recent_dev_log_entries(since_days=1) == []
+
+
+class TestExtraerCoste:
+    """
+    Regresion real (28/09/2026): el codigo leia `cost_usd` y la CLI emite
+    `total_cost_usd`, asi que TODAS las tareas de dev reportaron coste None durante
+    meses. No se detecto porque los tests de arriba fabrican la respuesta con la clave
+    que el codigo esperaba: validaban el mock, no la CLI.
+
+    Estos tests usan el output literal de `claude -p --output-format json`.
+    """
+
+    def test_lee_total_cost_usd_del_formato_actual(self):
+        data = {
+            "type": "result",
+            "subtype": "success",
+            "result": "¡Hola!",
+            "session_id": "abc",
+            "total_cost_usd": 0.020686,
+            "usage": {"input_tokens": 2340, "output_tokens": 30},
+        }
+        assert ce._extraer_coste(data) == 0.020686
+
+    def test_acepta_cost_usd_de_versiones_antiguas(self):
+        assert ce._extraer_coste({"result": "x", "cost_usd": 0.01}) == 0.01
+
+    def test_prefiere_total_cost_usd_si_estan_los_dos(self):
+        data = {"total_cost_usd": 0.02, "cost_usd": 0.01}
+        assert ce._extraer_coste(data) == 0.02
+
+    def test_devuelve_none_y_avisa_si_no_hay_ningun_campo_de_coste(self, caplog):
+        assert ce._extraer_coste({"result": "x", "session_id": "y"}) is None
+        assert "no devolvio ningun campo de coste" in caplog.text
+
+    def test_coste_cero_no_se_confunde_con_ausente(self):
+        # 0.0 es falsy: un `if not valor` lo trataria como si no estuviera.
+        assert ce._extraer_coste({"total_cost_usd": 0.0}) == 0.0
+
+
+class TestExtraerUso:
+
+    def test_aplana_el_usage_del_formato_actual(self):
+        data = {
+            "usage": {
+                "input_tokens": 2340,
+                "output_tokens": 30,
+                "cache_read_input_tokens": 16472,
+                "cache_creation_input_tokens": 0,
+            },
+            "modelUsage": {"claude-opus-4-8[1m]": {"costUSD": 0.020686}},
+        }
+        uso = ce._extraer_uso(data)
+        assert uso["input_tokens"] == 2340
+        assert uso["output_tokens"] == 30
+        assert uso["cache_read_input_tokens"] == 16472
+        assert uso["model"] == "claude-opus-4-8[1m]"
+
+    def test_devuelve_none_si_la_cli_no_informa_de_uso(self):
+        assert ce._extraer_uso({"result": "x"}) is None
+
+    def test_no_revienta_si_falta_modelUsage(self):
+        uso = ce._extraer_uso({"usage": {"input_tokens": 10, "output_tokens": 2}})
+        assert uso["model"] is None
+        assert uso["input_tokens"] == 10

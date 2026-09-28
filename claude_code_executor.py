@@ -204,10 +204,56 @@ def execute_task(task_content: str, directory_path: str) -> dict:
 
     return {
         "result": data.get("result"),
-        "cost_usd": data.get("cost_usd"),
+        "cost_usd": _extraer_coste(data),
+        "usage": _extraer_uso(data),
         "session_id": data.get("session_id"),
         "git_diff": get_git_diff(directory_path),
         "error": None,
+    }
+
+
+def _extraer_coste(data: dict) -> float | None:
+    """
+    Coste en USD de esta invocacion de claude -p.
+
+    La CLI emite `total_cost_usd` ("total" = de esta sesion, y cada `claude -p` es una
+    sesion nueva; con varios turnos internos los suma). Versiones antiguas usaban
+    `cost_usd`, asi que se acepta como alternativa.
+
+    Si no aparece ninguno se avisa por log en vez de devolver None en silencio: la CLI
+    no esta pinneada en el Dockerfile y un rebuild puede volver a renombrar el campo.
+    """
+    for clave in ("total_cost_usd", "cost_usd"):
+        valor = data.get(clave)
+        if valor is not None:
+            return valor
+
+    logger.warning(
+        "claude -p no devolvio ningun campo de coste conocido. Claves recibidas: %s. "
+        "Probablemente la CLI cambio de formato; revisa _extraer_coste().",
+        sorted(data.keys()),
+    )
+    return None
+
+
+def _extraer_uso(data: dict) -> dict | None:
+    """
+    Tokens consumidos por esta invocacion, aplanados a lo que interesa registrar.
+    Devuelve None si la CLI no informa de uso.
+    """
+    uso = data.get("usage")
+    if not isinstance(uso, dict):
+        return None
+
+    modelos = data.get("modelUsage")
+    modelo = next(iter(modelos), None) if isinstance(modelos, dict) else None
+
+    return {
+        "model": modelo,
+        "input_tokens": uso.get("input_tokens"),
+        "output_tokens": uso.get("output_tokens"),
+        "cache_read_input_tokens": uso.get("cache_read_input_tokens"),
+        "cache_creation_input_tokens": uso.get("cache_creation_input_tokens"),
     }
 
 
