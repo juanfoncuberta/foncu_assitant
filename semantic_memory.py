@@ -25,13 +25,47 @@ SIMILARITY_THRESHOLD = 0.62
 
 logger = logging.getLogger(__name__)
 
-logger.info("Loading sentence-transformers model (all-MiniLM-L6-v2)…")
-_model = SentenceTransformer("all-MiniLM-L6-v2")
-logger.info("Model loaded.")
+# El modelo y sus dependencias (torch, numpy, sqlite_vec) se cargan perezosamente.
+#
+# Antes se instanciaban al importar el modulo, lo que hacia que importar main.py
+# arrastrase ~20s y varios cientos de MB. Ese es el motivo real de que main.py nunca
+# haya tenido tests: cualquier test que lo importara pagaba esa factura.
+#
+# Para no trasladarle la espera al primer mensaje, main() llama a warmup() en un
+# hilo aparte al arrancar. Asi el import es barato y el modelo sigue listo a tiempo.
+_model = None
+_model_lock = threading.Lock()
+
+
+def _get_model():
+    global _model
+    if _model is None:
+        with _model_lock:
+            if _model is None:  # otro hilo pudo cargarlo mientras esperabamos
+                from sentence_transformers import SentenceTransformer
+
+                logger.info("Loading sentence-transformers model (all-MiniLM-L6-v2)…")
+                _model = SentenceTransformer("all-MiniLM-L6-v2")
+                logger.info("Model loaded.")
+    return _model
+
+
+def warmup() -> None:
+    """Precarga el modelo. Pensado para llamarse en un hilo daemon al arrancar."""
+    try:
+        _get_model()
+    except Exception:
+        logger.exception("Fallo al precargar el modelo de embeddings")
 
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    # WAL: sin esto un escritor bloquea la base entera. Contra este fichero escriben
+    # el hilo del bot, el de uvicorn (internal_api) y los workers de asyncio.to_thread.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    import sqlite_vec
+
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)

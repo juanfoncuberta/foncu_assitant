@@ -18,6 +18,10 @@ _NONE_SENTINEL = 0  # represents thread_id=None in the table
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    # WAL: sin esto un escritor bloquea la base entera. Contra este fichero escriben
+    # el hilo del bot, el de uvicorn (internal_api) y los workers de asyncio.to_thread.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS topic_project (
