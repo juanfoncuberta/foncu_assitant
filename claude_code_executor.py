@@ -15,6 +15,22 @@ DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 
 TIMEOUT_SECONDS = 600  # 10 minutes
 
+# Modelo por paso. Los pasos de planificacion y revision son de solo lectura y mucho
+# mas simples que la ejecucion, asi que no necesitan el modelo mas caro. Se dejan
+# vacios por defecto (= el que tenga configurado la CLI) para no romper nada; pon
+# PLAN_MODEL=sonnet y REVIEW_MODEL=sonnet en el .env cuando quieras bajar el coste.
+#
+# No fijes un modelo aqui sin medir antes: sin usage_log no sabes si el cambio ahorra
+# o si degrada la calidad del plan, que es lo que luego se compara contra el diff.
+PLAN_MODEL = os.environ.get("PLAN_MODEL", "").strip()
+EXEC_MODEL = os.environ.get("EXEC_MODEL", "").strip()
+REVIEW_MODEL = os.environ.get("REVIEW_MODEL", "").strip()
+
+
+def _flags_modelo(modelo: str) -> list[str]:
+    """['--model', X] si hay modelo configurado, o [] para usar el de la CLI."""
+    return ["--model", modelo] if modelo else []
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +148,7 @@ def execute_task(task_content: str, directory_path: str) -> dict:
                 "--output-format", "json",
                 "--permission-mode", "acceptEdits",
                 "--add-dir", directory_path,
+                *_flags_modelo(EXEC_MODEL),
             ],
             cwd=directory_path,
             capture_output=True,
@@ -224,6 +241,7 @@ def _get_plan(task_content: str, directory_path: str) -> str:
                 "--output-format", "json",
                 "--disallowedTools", "Edit,Write,Bash",
                 "--add-dir", directory_path,
+                *_flags_modelo(PLAN_MODEL),
             ],
             cwd=directory_path,
             capture_output=True,
