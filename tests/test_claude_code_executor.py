@@ -333,6 +333,7 @@ class TestExecuteTaskOnBranch:
     @pytest.fixture(autouse=True)
     def _plan_mock(self, mocker):
         mocker.patch("claude_code_executor._get_plan", return_value="mocked plan")
+        mocker.patch("claude_code_executor._run_reviewer", return_value="mocked review")
 
     def test_branch_prefix_matches_classify_task(self, mocker):
         mock_run = mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
@@ -424,6 +425,12 @@ class TestExecuteTaskOnBranch:
         all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
         assert not any(cmd.startswith("git commit") for cmd in all_cmds)
 
+    def test_reviewer_runs_after_successful_execution(self, mocker):
+        mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
+        result = ce.execute_task_on_branch("add feature", "/path")
+        ce._run_reviewer.assert_called_once()
+        assert result["review"] == "mocked review"
+
 
 # ---------------------------------------------------------------------------
 # dev_log — _save_dev_log / get_recent_dev_log_entries
@@ -506,6 +513,7 @@ class TestExecuteTaskOnBranchDevLog:
     @pytest.fixture(autouse=True)
     def _plan_mock(self, mocker):
         mocker.patch("claude_code_executor._get_plan", return_value="mocked plan")
+        mocker.patch("claude_code_executor._run_reviewer", return_value="mocked review")
 
     def test_saves_dev_log_on_success(self, mocker, tmp_path, monkeypatch):
         monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))
