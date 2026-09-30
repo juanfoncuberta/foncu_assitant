@@ -13,8 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @anthropic-ai/claude-code
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements-dev.txt (pytest) tambien: Claude Code ejecuta los tests DENTRO de este
+# contenedor, tanto el hook PostToolUse como las tareas de ejecutar_tarea_dev.
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 
 COPY *.py .
 COPY AGENT_CAPABILITIES.md .

@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "venv/bin/pytest -m \"not integration\" -q",
+            "command": "if [ -x venv/bin/python ]; then venv/bin/python -m pytest -m 'not integration' -q; else python -m pytest -m 'not integration' -q; fi",
             "timeout": 120
           }
         ]
