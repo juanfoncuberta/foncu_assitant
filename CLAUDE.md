@@ -79,26 +79,7 @@ Si un mismo comando o test falla dos veces con el mismo error, no lo intentes un
 tercera vez. Detente y explica en tu resumen final qué fallaba, qué probaste y
 cuál crees que es la causa. Nunca te quedes reintentando en bucle.
 
-## Permisos dentro de `ejecutar_tarea_dev`
+## Tareas lanzadas por `ejecutar_tarea_dev`
 
-Esta sección aplica cuando `claude_code_executor.py` te invoca en modo headless
-para ejecutar una tarea de Todoist.
-
-El executor ya garantiza por su cuenta:
-
-- La llamada de planificación (`_get_plan`) se lanza con
-  `--disallowedTools Edit,Write,Bash` — es de solo lectura por obligación.
-- El plan se pide **siempre**, para cualquier tarea, y se guarda en `dev_log.plan`.
-- La ejecución ocurre en una rama nueva, nunca sobre la rama original.
-
-Lo que se espera de ti según el tipo de tarea:
-
-| Tipo de tarea | Comportamiento esperado |
-|---|---|
-| Consulta / lectura (sin cambios de código) | No edites nada. Responde y termina |
-| Cambio acotado con tests (caso normal) | Cíñete a los archivos del plan. Añade o ajusta tests. `Bash` solo para `pytest`, lint y git |
-| Cambio estructural (varios módulos) | Igual, pero si el plan declarado se queda corto, para y repórtalo antes de ampliar el alcance por tu cuenta |
-
-Al terminar, tu resumen final debe incluir qué problema resolvías, qué cambiaste
-y por qué ese enfoque lo resuelve. El executor añade por su cuenta el diff, el
-coste y el `session_id`.
+El procedimiento vive en `.claude/skills/ejecutar-tarea-dev/SKILL.md` y solo se
+carga cuando toca. No lo dupliques aquí.
