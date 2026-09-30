@@ -204,6 +204,49 @@ class TestExecuteTask:
         assert "not valid JSON" in result["error"]
         assert result["result"] is None
 
+    def test_allows_only_git_and_pytest_commands(self, mocker):
+        mock_run = mocker.patch(
+            "subprocess.run",
+            side_effect=[cp(0, _json_output("ok")), cp(0, "")],
+        )
+        ce.execute_task("do something", "/path")
+        args = mock_run.call_args_list[0].args[0]
+        assert "--allowedTools" in args
+        allowed = args[args.index("--allowedTools") + 1].split(",")
+        assert "Bash(git commit:*)" in allowed
+        assert "Bash(pytest:*)" in allowed
+        # Nunca Bash libre ni comandos que salgan de la rama o destruyan trabajo.
+        assert "Bash" not in allowed
+        for peligroso in ("push", "checkout", "reset", "rm ", "merge"):
+            assert not any(peligroso in a for a in allowed), peligroso
+
+
+class TestBuildExecPrompt:
+    def test_names_the_skill(self):
+        assert "ejecutar-tarea-dev" in ce._build_exec_prompt("add x", "edit foo.py")
+
+    def test_includes_task_and_plan(self):
+        prompt = ce._build_exec_prompt("add x handler", "Would edit foo.py only.")
+        assert "add x handler" in prompt
+        assert "Would edit foo.py only." in prompt
+
+    def test_keeps_commit_instructions(self):
+        assert ce._COMMIT_INSTRUCTIONS in ce._build_exec_prompt("add x", "plan")
+
+
+class TestFallbackCommitMessage:
+    def test_keeps_prefix_and_is_english(self):
+        msg = ce._fallback_commit_message("feat/anadir-docstring-funcion-fallback-135351")
+        assert msg == "feat: apply changes from automated dev task"
+
+    def test_does_not_leak_the_spanish_slug(self):
+        msg = ce._fallback_commit_message("fix/arreglar-login-roto-120000")
+        assert msg.startswith("fix: ")
+        assert "arreglar" not in msg
+
+    def test_branch_without_prefix_falls_back_to_chore(self):
+        assert ce._fallback_commit_message("rama-rara").startswith("chore: ")
+
 
 # ---------------------------------------------------------------------------
 # _fallback_commit
@@ -424,6 +467,14 @@ class TestExecuteTaskOnBranch:
         # The only commit-like call should NOT be a git commit
         all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
         assert not any(cmd.startswith("git commit") for cmd in all_cmds)
+
+    def test_exec_prompt_carries_plan_and_skill(self, mocker):
+        mock_run = mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
+        ce.execute_task_on_branch("add feature", "/path")
+        claude_call = next(c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "claude")
+        prompt = claude_call[claude_call.index("-p") + 1]
+        assert "mocked plan" in prompt
+        assert "ejecutar-tarea-dev" in prompt
 
     def test_reviewer_runs_after_successful_execution(self, mocker):
         mocker.patch("subprocess.run", side_effect=_branch_exec_calls())

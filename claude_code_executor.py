@@ -134,6 +134,21 @@ def get_git_diff(directory_path: str) -> str:
         return "(no se pudo obtener el diff)"
 
 
+# Comandos que la ejecucion puede lanzar sin aprobacion. `--permission-mode acceptEdits`
+# solo aprueba ediciones de archivos: sin esta lista, en headless no hay nadie que apruebe
+# un `git commit` o un `pytest` y se rechazan todos (todas las tareas acababan en el commit
+# de fallback). Lista cerrada a proposito: nada de push, checkout, reset, rm ni Bash libre.
+_EXEC_ALLOWED_TOOLS = ",".join([
+    "Bash(git add:*)",
+    "Bash(git commit:*)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(pytest:*)",
+    "Bash(python -m pytest:*)",
+])
+
+
 def execute_task(task_content: str, directory_path: str) -> dict:
     """
     Invokes Claude Code headless with task_content as the prompt, working inside directory_path.
@@ -147,6 +162,7 @@ def execute_task(task_content: str, directory_path: str) -> dict:
                 "-p", task_content,
                 "--output-format", "json",
                 "--permission-mode", "acceptEdits",
+                "--allowedTools", _EXEC_ALLOWED_TOOLS,
                 "--add-dir", directory_path,
                 *_flags_modelo(EXEC_MODEL),
             ],
@@ -454,12 +470,36 @@ In your final response, include 2-4 sentences describing: what the problem or go
 what you changed, and why that approach solves it."""
 
 
+_EXEC_PROMPT_TEMPLATE = """Follow the `ejecutar-tarea-dev` skill for this task.
+
+Task:
+{task_content}
+
+Plan declared before execution. Stay within it; if it falls short, stop and report \
+instead of widening the scope on your own:
+{plan}
+"""
+
+
+def _build_exec_prompt(task_content: str, plan: str) -> str:
+    """
+    Prompt for the execution step. Names the skill explicitly (Claude Code did not load it
+    from the description alone) and includes the declared plan, which the execution step
+    never saw before even though CLAUDE.md, the skill and the reviewer all rely on it.
+    """
+    return _EXEC_PROMPT_TEMPLATE.format(task_content=task_content, plan=plan) + _COMMIT_INSTRUCTIONS
+
+
 def _fallback_commit_message(branch_name: str) -> str:
-    # Derive a plain English message from the branch slug, avoiding Spanish task text.
-    # "feat/add-docstring-main-143215" -> "add docstring main"
-    slug = branch_name.split("/", 1)[-1]
-    slug = re.sub(r"-\d{6}$", "", slug)  # strip HHMMSS suffix
-    return slug.replace("-", " ")
+    """
+    Generic English commit subject for the fallback commit: "<prefix>: apply changes
+    from automated dev task", keeping the branch prefix (feat/fix/chore).
+
+    It does NOT use the branch slug: the slug comes from the task text, which is
+    written in Spanish, so it produced subjects like "anadir docstring funcion ...".
+    """
+    prefix = branch_name.split("/", 1)[0] if "/" in branch_name else "chore"
+    return f"{prefix}: apply changes from automated dev task"
 
 
 def _fallback_commit(branch_name: str, directory_path: str) -> str | None:
@@ -555,7 +595,7 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
 
     plan = _get_plan(task_content, directory_path)
 
-    enriched_prompt = task_content + _COMMIT_INSTRUCTIONS
+    enriched_prompt = _build_exec_prompt(task_content, plan)
 
     result: dict = {}
     try:
