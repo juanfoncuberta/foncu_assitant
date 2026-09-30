@@ -7,3 +7,7 @@ assistant.db
 assistant.db-journal
 .claude/settings.local.json
 connect_ocean.sh
+
+# Auditorias: solo en local, describen puntos debiles del sistema
+docs/auditoria-*.md
+docs/decisions/*auditoria*.md
