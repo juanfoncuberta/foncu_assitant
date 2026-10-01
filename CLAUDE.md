@@ -17,6 +17,24 @@ Claude Code, lee `docs/agent-architecture.md` antes de escribir nada aquí.
 - Sin firmas de ningún tipo (`Co-authored-by`, `Generated with`, etc.). Ya están
   desactivadas en `.claude/settings.json`; no las añadas a mano.
 
+## Ramas
+
+- **Nunca se commitea, mergea ni hace push sobre `main`.** Todo cambio va en su
+  propia rama, en cualquier sesión — no solo en las de `ejecutar_tarea_dev`.
+- Antes del primer commit, crea la rama desde `main` actualizado:
+  `git switch -c <prefijo>/<slug>`.
+  - Prefijo según el tipo de cambio: `feat/`, `fix/`, `chore/` o `docs/`.
+  - Slug en inglés, en minúsculas y con guiones, describiendo el cambio
+    (ej. `chore/main-security-tests`, `fix/tool-name-invalid-chars`).
+- Se hace push de la rama, nunca de `main`. Integrar en `main` (merge o PR) lo
+  decide y lo hace el usuario.
+- Si ya has commiteado en `main` por error y no hay push, mueve el commit a una
+  rama nueva y deja `main` igual que `origin/main`; si ya hubo push, para y avisa.
+
+Un hook `PreToolUse` sobre `Bash` (`.claude/hooks/block_commits_on_main.py`)
+bloquea commits, merges, rebases y pushes sobre `main`. Si te bloquea, crea la
+rama; no busques una vía alternativa.
+
 ## Reglas de arquitectura (no negociables)
 
 - **Nunca reescribas lógica de producción existente** para facilitar su testeo,
