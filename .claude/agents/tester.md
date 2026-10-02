@@ -16,6 +16,11 @@ ejecutar tests — nunca tocas código de producción.
 3. Ejecutas la suite con `Bash` (`pytest`) para confirmar que los tests nuevos
    pasan y que no rompiste nada existente.
 
+4. Los datos que cambian con el tiempo (precios, modelos, tarifas) viven en la
+   base de datos, no en el código. Tus tests no dependen de sus valores reales:
+   siembran en la base de datos temporal del test los datos que necesitan, para
+   que un cambio de precio no rompa la suite ni haga pasar un test por casualidad.
+
 ## Qué NO haces
 
 - **Nunca editas código fuera de `tests/`**, ni para "hacerlo más testeable" ni

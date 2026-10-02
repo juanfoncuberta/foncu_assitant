@@ -46,6 +46,31 @@ rama; no busques una vía alternativa.
 - Los controllers/handlers (`main.py`) no acceden a la base de datos
   directamente — pasan por los módulos `*_client.py` / `*_provider.py`.
 - Los secretos viven solo en `.env`, nunca en código ni en commits.
+- **Todo servicio externo va detrás de una interfaz y se obtiene por factory.**
+  El resto del sistema habla con la interfaz, nunca con el proveedor concreto,
+  para que cambiar o añadir uno sea escribir una clase y registrarla en
+  `provider_factory.py`. Es el patrón que ya siguen las tareas
+  (`TaskProvider` → `TodoistProvider`) y el consumo de IA
+  (`UsageProvider` → `AnthropicApiUsageProvider`, `ClaudeCodeUsageProvider`).
+- **Ningún nombre ata el sistema a un proveedor**: ni tools, ni tablas, ni
+  columnas, ni funciones públicas (`consultar_gasto_ia`, no
+  `consultar_gasto_claude`). El proveedor es un dato que se guarda, no parte
+  del nombre.
+- **La configuración vive en un único sitio**: `config.py`, que lee el entorno
+  en cada llamada. Ningún módulo repite literales como la ruta de la base de
+  datos, URLs o nombres de servicio; los pide a `config`. Si necesitas un valor
+  nuevo, añádelo allí con su variable de entorno.
+- **Los datos que cambian con el tiempo no se escriben en el código**: precios,
+  tarifas, catálogos de modelos, límites comerciales, fechas de consulta y
+  cualquier valor que dependa de un tercero o del negocio. Van en la base de
+  datos, que es la fuente de verdad; un archivo de datos versionado (JSON) solo
+  la siembra con lo que falte, sin pisar lo que ya haya; y se cambian sin tocar
+  código (una tool del bot con confirmación de Nivel 3). Ejemplo:
+  `model_prices.py` + `model_prices.json` + `actualizar_precio_ia`.
+  Lo que sí puede ir en el código: constantes técnicas que solo cambian si
+  cambia el propio código (timeouts, nombres de columnas, formatos).
+  Los tests no dependen de los valores reales: siembran en la base de datos
+  temporal los datos que necesitan.
 
 ## Archivos protegidos
 
@@ -90,6 +115,20 @@ Una tarea no está completa hasta que:
 
 Si algo de esto falla, la tarea se reporta como fallida con el motivo — nunca
 como "hecho" a medias.
+
+### Antes de commitear en una sesión interactiva
+
+Fuera de `ejecutar_tarea_dev` (que ya pasa por el `reviewer` dentro de su propio
+flujo), ningún commit se hace sin este orden:
+
+1. `pytest` completo en verde.
+2. El subagent `reviewer` revisa el diff contra lo que pidió el usuario. Se le da
+   el plan, no la explicación de cómo se hizo: si revisa el mismo agente que
+   escribió el código, no hay revisión.
+3. Se presenta al usuario el resumen de los cambios y el informe del `reviewer`
+   tal cual, sin filtrar los hallazgos.
+4. Se commitea solo tras su confirmación explícita. Hasta entonces los cambios se
+   quedan sin commitear en la rama de trabajo.
 
 ## Reintentos
 
