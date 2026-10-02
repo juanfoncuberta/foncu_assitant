@@ -47,3 +47,12 @@ def set_directory(project_id: str, directory_path: str) -> None:
             """,
             (project_id, directory_path),
         )
+
+
+def label_for_directory(directory_path: str) -> str:
+    """
+    Nombre con el que se imputa el gasto de un proyecto que tiene carpeta: el de la
+    carpeta. Unico sitio con esta regla: lo usan las tareas de dev y el chat, y si
+    cada uno la escribiera a su manera el mismo proyecto saldria con dos nombres.
+    """
+    return os.path.basename(os.path.normpath(directory_path))

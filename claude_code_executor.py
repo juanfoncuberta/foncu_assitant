@@ -11,6 +11,9 @@ import subprocess
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
+import project_directory_map
+import usage_log
+
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 
 TIMEOUT_SECONDS = 600  # 10 minutes
@@ -25,6 +28,15 @@ TIMEOUT_SECONDS = 600  # 10 minutes
 PLAN_MODEL = os.environ.get("PLAN_MODEL", "").strip()
 EXEC_MODEL = os.environ.get("EXEC_MODEL", "").strip()
 REVIEW_MODEL = os.environ.get("REVIEW_MODEL", "").strip()
+
+
+def _proyecto(directory_path: str) -> str:
+    """
+    Proyecto al que se imputa el gasto de una tarea: el nombre de su carpeta. Es el
+    mismo nombre que usa el chat cuando el proyecto tiene carpeta vinculada
+    (project_map.get_project_label).
+    """
+    return project_directory_map.label_for_directory(directory_path)
 
 
 def _flags_modelo(modelo: str) -> list[str]:
@@ -149,10 +161,11 @@ _EXEC_ALLOWED_TOOLS = ",".join([
 ])
 
 
-def execute_task(task_content: str, directory_path: str) -> dict:
+def execute_task(task_content: str, directory_path: str, origin: str | None = None) -> dict:
     """
     Invokes Claude Code headless with task_content as the prompt, working inside directory_path.
     Returns a dict with: result, cost_usd, session_id, error.
+    `origin` (normally the branch name) is only used to label the usage_log entry.
     Never raises — all failures are captured in the 'error' key.
     """
     try:
@@ -217,6 +230,8 @@ def execute_task(task_content: str, directory_path: str) -> dict:
             "cost_usd": None,
             "session_id": None,
         }
+
+    usage_log.record("claude_code", _proyecto(directory_path), "exec", data, origin=origin)
 
     return {
         "result": data.get("result"),
@@ -289,7 +304,7 @@ Task:
 {task_content}"""
 
 
-def _get_plan(task_content: str, directory_path: str) -> str:
+def _get_plan(task_content: str, directory_path: str, origin: str | None = None) -> str:
     """
     Read-only planning call (no Edit/Write/Bash tools): asks Claude Code to describe the
     approach it would take *before* any code is touched, so the plan can later be compared
@@ -322,6 +337,8 @@ def _get_plan(task_content: str, directory_path: str) -> str:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return "(no se pudo obtener el plan previo)"
+
+    usage_log.record("claude_code", _proyecto(directory_path), "plan", data, origin=origin)
 
     return (data.get("result") or "").strip() or "(plan vacío)"
 
@@ -403,6 +420,8 @@ def _run_reviewer(
     except json.JSONDecodeError:
         logger.warning("Revisión: salida no-JSON de claude -p")
         return "(la revisión devolvió una salida ilegible — revisa el diff a mano)"
+
+    usage_log.record("claude_code", _proyecto(directory_path), "review", data, origin=branch_name)
 
     return (data.get("result") or "").strip() or "(la revisión no devolvió nada)"
 
@@ -593,13 +612,13 @@ def execute_task_on_branch(task_content: str, directory_path: str) -> dict:
             "git_diff": None,
         }
 
-    plan = _get_plan(task_content, directory_path)
+    plan = _get_plan(task_content, directory_path, origin=branch_name)
 
     enriched_prompt = _build_exec_prompt(task_content, plan)
 
     result: dict = {}
     try:
-        result = execute_task(enriched_prompt, directory_path)
+        result = execute_task(enriched_prompt, directory_path, origin=branch_name)
         result["branch"] = branch_name
         result["plan"] = plan
 

@@ -11,6 +11,8 @@ Telegram chats never share a project mapping.
 import os
 import sqlite3
 
+import project_directory_map
+
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 
 _NONE_SENTINEL = 0  # represents thread_id=None in the table
@@ -60,3 +62,27 @@ def set_project_id(chat_id: int, thread_id: int | None, project_id: str, project
             """,
             (chat_id, key, project_id, project_name),
         )
+
+
+
+def get_project_label(chat_id: int, thread_id: int | None) -> str | None:
+    """
+    Nombre con el que se imputa el gasto de un topic.
+
+    Si su proyecto tiene carpeta vinculada (vincular_carpeta_proyecto), el nombre de
+    esa carpeta: es el mismo que usan las tareas de dev y casi nunca cambia. Si no,
+    el nombre del proyecto en el gestor de tareas. None si el topic no tiene proyecto.
+    """
+    key = _NONE_SENTINEL if thread_id is None else thread_id
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT project_id, project_name FROM topic_project WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, key),
+        ).fetchone()
+    if not row:
+        return None
+    project_id, project_name = row
+    directorio = project_directory_map.get_directory(project_id)
+    if directorio:
+        return project_directory_map.label_for_directory(directorio)
+    return project_name

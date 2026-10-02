@@ -13,6 +13,9 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
+import usage_log
+from project_map import get_project_label
+
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
 _NONE_SENTINEL = 0
 MAX_HISTORY = 15
@@ -151,6 +154,10 @@ def trim_and_summarize(chat_id: int, topic_id: int | None, claude_client) -> Non
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
+        )
+        usage_log.record(
+            "anthropic_api", usage_log.project_of(get_project_label, chat_id, topic_id),
+            "summary", response, origin=f"chat:{chat_id}/{topic_id}",
         )
         new_summary = response.content[0].text
         _set_summary(chat_id, topic_id, new_summary)

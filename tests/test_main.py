@@ -445,6 +445,9 @@ class TestEjecutarTareaDev:
         self.get_dir = MagicMock(return_value="/opt/app")
         self.git = MagicMock(return_value={"is_git": True, "is_clean": True})
         self.ejecutar = MagicMock(return_value={"status": "ok", "git_diff": ""})
+        self.provider = MagicMock()
+        self.provider.list_projects.return_value = [{"id": "p1", "name": "foncu_assistant"}]
+        monkeypatch.setattr(main, "provider", self.provider)
         monkeypatch.setattr(main, "todoist_client", self.todoist)
         monkeypatch.setattr(main, "get_project_directory", self.get_dir)
         monkeypatch.setattr(main, "check_git_status", self.git)
@@ -457,6 +460,11 @@ class TestEjecutarTareaDev:
         res = self._llamar()
         assert res == {"status": "ok", "git_diff": ""}
         self.ejecutar.assert_called_once_with("anade un test", "/opt/app")
+
+    def test_no_consulta_el_gestor_de_tareas_para_el_nombre_del_proyecto(self):
+        # El gasto se imputa con el nombre de la carpeta: no hace falta otra llamada.
+        self._llamar()
+        self.provider.list_projects.assert_not_called()
 
     def test_repo_sucio_pide_confirmacion_y_no_ejecuta(self):
         self.git.return_value = {"is_git": True, "is_clean": False}

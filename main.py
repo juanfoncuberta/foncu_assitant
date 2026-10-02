@@ -24,8 +24,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import digitalocean_client
 import internal_api
+import model_prices
 import provider_factory
 import todoist_client
+import usage_log
 from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
 from content_sources import (
     add_source as add_content_source,
@@ -34,7 +36,7 @@ from content_sources import (
 )
 from conversation_memory import add_message, get_history, get_summary, reset_topic, trim_and_summarize
 from project_directory_map import get_directory as get_project_directory, set_directory as set_project_directory
-from project_map import get_project_id, set_project_id
+from project_map import get_project_id, get_project_label, set_project_id
 from semantic_memory import add_semantic_memory, search_similar, warmup as warmup_embeddings
 
 load_dotenv()
@@ -273,7 +275,19 @@ contenido (blogs, RSS, newsletters) para el agente de LinkedIn/X.
 
 Puedes consultar el gasto de infraestructura de Juan en DigitalOcean con
 consultar_gasto_digitalocean (sin parámetros). Úsala cuando pregunte por el coste,
-saldo o factura del mes en curso."""
+saldo o factura del mes en curso.
+
+Puedes consultar lo que lleva gastado en modelos de IA (este bot y las tareas de
+desarrollo) con consultar_gasto_ia. Úsala cuando pregunte cuánto cuesta el asistente
+o el gasto en IA, sea del proveedor que sea. Para un proyecto concreto pásale
+'project'. Si hay cualquier duda sobre a qué proyecto se refiere, o la tool responde
+que no lo encuentra, no adivines: enséñale a Juan la lista 'proyectos_con_gasto' y
+pregúntale cuál quiere.
+
+Los precios de los modelos de IA están en la base de datos. consultar_precios_ia los
+lista. actualizar_precio_ia los cambia o añade un modelo nuevo: es de Nivel 3, así que
+la primera llamada solo devuelve el precio actual y el resultante; enséñaselos a Juan y
+solo tras un sí explícito vuelve a llamarla con force_update: true."""
 
 
 def _load_capabilities() -> str:
@@ -556,6 +570,74 @@ TOOLS = [
         },
     },
     {
+        "name": "consultar_gasto_ia",
+        "description": (
+            "Consulta lo gastado en modelos de IA hoy y en el mes en curso: total, y "
+            "desglosado por proyecto, por proveedor y por modelo (llamadas, tokens de "
+            "entrada y salida, coste, precio por millón de tokens aplicado en el periodo "
+            "y precio vigente hoy). Con 'project', solo ese proyecto."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Proyecto del que consultar el gasto. Omitir para el total. Si no "
+                        "coincide con ninguno, la tool devuelve la lista de proyectos con gasto."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "consultar_precios_ia",
+        "description": (
+            "Lista los precios registrados de los modelos de IA (USD por millón de "
+            "tokens, y por 1000 búsquedas web), con su fecha de consulta y fuente. "
+            "Pasa 'provider' para filtrar por proveedor."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "description": "Proveedor a filtrar (ej. 'anthropic'). Omitir para todos.",
+                },
+            },
+        },
+    },
+    {
+        "name": "actualizar_precio_ia",
+        "description": (
+            "Crea o cambia el precio de un modelo de IA en la base de datos. Afecta al "
+            "cálculo de todo el gasto futuro. Los campos que no pases conservan su valor "
+            "actual (en un modelo nuevo, valen 0). Sin force_update devuelve "
+            "{requires_confirmation: true} con el precio actual y el resultante, sin "
+            "guardar nada; tras confirmación explícita de Juan, llama de nuevo con "
+            "force_update: true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider": {"type": "string", "description": "Proveedor (ej. 'anthropic')"},
+                "model": {"type": "string", "description": "Id del modelo (ej. 'claude-sonnet-4-6')"},
+                "input_per_mtok": {"type": "number", "description": "USD por millón de tokens de entrada"},
+                "output_per_mtok": {"type": "number", "description": "USD por millón de tokens de salida"},
+                "cache_write_per_mtok": {"type": "number", "description": "USD por millón de tokens escritos en caché (5 min)"},
+                "cache_read_per_mtok": {"type": "number", "description": "USD por millón de tokens leídos de caché"},
+                "web_search_per_1k": {"type": "number", "description": "USD por cada 1000 búsquedas web"},
+                "checked_at": {"type": "string", "description": "Fecha en que se consultó el precio, YYYY-MM-DD"},
+                "source_url": {"type": "string", "description": "URL de la página de precios consultada"},
+                "force_update": {
+                    "type": "boolean",
+                    "description": "true solo tras una respuesta afirmativa explícita al aviso previo.",
+                },
+            },
+            "required": ["provider", "model", "input_per_mtok", "output_per_mtok", "checked_at"],
+        },
+    },
+    {
         "name": "consultar_gasto_digitalocean",
         "description": (
             "Consulta el saldo y el gasto del mes en curso en DigitalOcean. "
@@ -727,6 +809,48 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
     if name == "consultar_gasto_digitalocean":
         return _digitalocean_summary()
 
+    if name == "consultar_gasto_ia":
+        pedido = tool_input.get("project")
+        if not pedido:
+            return usage_log.get_summary()
+        proyecto = usage_log.resolve_project(pedido)
+        if proyecto is None:
+            return {
+                "error": f"No hay gasto registrado para un proyecto llamado '{pedido}'.",
+                "proyectos_con_gasto": usage_log.list_projects(),
+            }
+        return {"project": proyecto, **usage_log.get_summary(project=proyecto)}
+
+    if name == "consultar_precios_ia":
+        return model_prices.list_prices(tool_input.get("provider"))
+
+    if name == "actualizar_precio_ia":
+        pedidos = {
+            k: tool_input[k]
+            for k in ("provider", "model", "input_per_mtok", "output_per_mtok",
+                      "cache_write_per_mtok", "cache_read_per_mtok", "web_search_per_1k",
+                      "checked_at", "source_url")
+            if tool_input.get(k) is not None
+        }
+        actual = model_prices.get_exact_price(pedidos.get("provider", ""), pedidos.get("model", ""))
+        # Lo que no se pasa conserva su valor actual: actualizar entrada y salida no
+        # puede poner a 0 la cache ni las busquedas sin que nadie lo vea.
+        campos = {
+            **{k: actual[k] for k in model_prices.PRICE_FIELDS + ("source_url",) if actual},
+            **pedidos,
+        }
+        if not tool_input.get("force_update", False):
+            return {
+                "requires_confirmation": True,
+                "reason": "Cambiar un precio altera el cálculo de todo el gasto a partir de ahora.",
+                "precio_actual": actual,
+                "precio_resultante": campos,
+            }
+        try:
+            return {"status": "guardado", "precio": model_prices.upsert_price(**campos)}
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+
     raise ValueError(f"Herramienta desconocida: {name}")
 
 
@@ -761,10 +885,33 @@ def _format_do_summary_message(title: str, summary: dict) -> str:
     )
 
 
-async def _send_do_check(context: ContextTypes.DEFAULT_TYPE, title: str) -> None:
+def _format_ia_line() -> str:
+    """Linea de gasto en IA para el aviso diario. Nunca lanza."""
+    try:
+        resumen = usage_log.get_summary()
+    except Exception:
+        logger.exception("No se pudo leer usage_log para el aviso diario")
+        return "IA: no se pudo leer el gasto (revisa los logs)."
+    hoy, mes = resumen["hoy"], resumen["mes"]
+    desglose = ", ".join(
+        f"{proveedor} ${coste:.2f}" for proveedor, coste in sorted(mes["por_proveedor"].items())
+    )
+    linea = f"IA — hoy: ${hoy['total_usd']:.2f} · mes: ${mes['total_usd']:.2f}"
+    if desglose:
+        linea += f" ({desglose})"
+    if mes["registros_sin_coste"]:
+        linea += f"\nOjo: {mes['registros_sin_coste']} llamadas sin precio conocido no suman."
+    return linea
+
+
+async def _send_do_check(
+    context: ContextTypes.DEFAULT_TYPE, title: str, incluir_ia: bool = False
+) -> None:
     try:
         summary = _digitalocean_summary()
         text = _format_do_summary_message(title, summary)
+        if incluir_ia:
+            text += "\n\n" + _format_ia_line()
         await context.bot.send_message(chat_id=int(OWNER_CHAT_ID), text=text)
     except Exception as exc:
         logger.exception("Error en el chequeo de DigitalOcean (%s)", title)
@@ -779,7 +926,7 @@ async def morning_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def evening_do_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_do_check(context, "Aviso de fin de jornada")
+    await _send_do_check(context, "Aviso de fin de jornada", incluir_ia=True)
 
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -827,6 +974,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         system += f"\n\nContexto relevante de conversaciones anteriores (similitud semántica):\n{lines}"
 
     messages: list[dict] = history + [{"role": "user", "content": user_text}]
+    proyecto = await asyncio.to_thread(usage_log.project_of, get_project_label, chat_id, thread_id)
 
     while True:
         # to_thread: el cliente de Anthropic es sincrono. Llamarlo directo desde un
@@ -839,6 +987,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             system=system,
             tools=TOOLS,
             messages=messages,
+        )
+
+        # to_thread: escribe en SQLite y, con la base ocupada, no debe congelar el bot.
+        await asyncio.to_thread(
+            usage_log.record, "anthropic_api", proyecto, "chat", response,
+            f"chat:{chat_id}/{thread_id}",
         )
 
         if response.stop_reason != "tool_use":
@@ -885,7 +1039,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         add_message(chat_id, thread_id, "assistant", reply_text)
         add_semantic_memory(chat_id, thread_id, "user", user_text)
         add_semantic_memory(chat_id, thread_id, "assistant", reply_text)
-        trim_and_summarize(chat_id, thread_id, claude)
+        # to_thread: resume con una llamada a Claude que tarda segundos. Hecha aqui
+        # directamente bloquearia el event loop (y con el, los jobs programados).
+        # Los mensajes siguientes siguen esperando su turno: el bot los atiende de uno
+        # en uno.
+        await asyncio.to_thread(trim_and_summarize, chat_id, thread_id, claude)
 
 
 async def _saludo_de_arranque(app) -> None:
@@ -934,6 +1092,10 @@ def main() -> None:
     # sea barato (y testeable). Se precalienta aqui, en segundo plano, para que el
     # primer mensaje no pague los ~20s de carga.
     threading.Thread(target=warmup_embeddings, daemon=True).start()
+
+    # Siembra los precios de modelos que aun no esten en la base de datos. No pisa
+    # los que ya existan (los actualizados con actualizar_precio_ia se respetan).
+    model_prices.load_seed()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_saludo_de_arranque).build()
     app.add_handler(CommandHandler("reset", handle_reset))

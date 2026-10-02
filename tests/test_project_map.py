@@ -42,3 +42,40 @@ def test_unknown_thread_returns_none():
     pm.set_project_id(1, 1, "proj-123", "Something")
     assert pm.get_project_id(1, 99) is None
     assert pm.get_project_id(99, 1) is None
+
+
+
+
+def test_label_sin_carpeta_es_el_nombre_del_proyecto():
+    pm.set_project_id(1, 7, "p9", "Cuoco")
+    assert pm.get_project_label(1, 7) == "Cuoco"
+
+
+def test_label_con_carpeta_vinculada_es_el_nombre_de_la_carpeta(monkeypatch, tmp_path):
+    import project_directory_map as pdm
+    monkeypatch.setattr(pdm, "DB_PATH", str(tmp_path / "test.db"))
+    pm.set_project_id(1, 7, "p1", "Foncu Assistant")
+    pdm.set_directory("p1", "/opt/foncu_assitant/")
+
+    # El mismo nombre que usan las tareas de dev para ese proyecto.
+    assert pm.get_project_label(1, 7) == "foncu_assitant"
+
+
+def test_label_sin_proyecto_vinculado_es_none():
+    assert pm.get_project_label(1, 99) is None
+
+
+def test_label_con_thread_none():
+    pm.set_project_id(1, None, "p1", "Trabajo")
+    assert pm.get_project_label(1, None) == "Trabajo"
+
+
+
+def test_dev_y_chat_usan_la_misma_regla_de_nombre(monkeypatch, tmp_path):
+    import claude_code_executor as ce
+    import project_directory_map as pdm
+    monkeypatch.setattr(pdm, "DB_PATH", str(tmp_path / "test.db"))
+    pm.set_project_id(1, 7, "p1", "Foncu Assistant")
+    pdm.set_directory("p1", "/opt/foncu_assitant/")
+
+    assert pm.get_project_label(1, 7) == ce._proyecto("/opt/foncu_assitant/")

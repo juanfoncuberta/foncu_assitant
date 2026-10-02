@@ -35,6 +35,8 @@ al usuario antes ni después, salvo que el resultado en sí sea la respuesta esp
 | `listar_fuentes_contenido` | Solo lectura                                        |
 | `desactivar_fuente_contenido` | Marca una fuente como inactiva; reversible      |
 | `consultar_gasto_digitalocean` | Solo lectura sobre la API de DigitalOcean   |
+| `consultar_gasto_ia` | Solo lectura sobre `usage_log` (gasto en IA, cualquier proveedor) |
+| `consultar_precios_ia` | Solo lectura sobre `model_prices` |
 
 ---
 
@@ -60,15 +62,16 @@ automáticamente — esa decisión la toma el usuario.
 |-----------------------------|---------------------------------------------------------------------|
 | `eliminar_tarea`            | Irreversible en Todoist (borrado real, no completar)                |
 | `ejecutar_tarea_dev`        | Cuando `directory_path` **no** es un repo Git, o tiene cambios sin commitear — no hay red de seguridad para revertir |
+| `actualizar_precio_ia`      | Cambia el precio con el que se calcula todo el gasto futuro en IA; un error pasa desapercibido en los totales |
 | Publicación externa (futuro) | LinkedIn, X u otras plataformas públicas, cuando se implementen    |
 
-En ambos casos la confirmación no depende de que el modelo se acuerde de pedirla:
+En todos los casos la confirmación no depende de que el modelo se acuerde de pedirla:
 la tool devuelve `{requires_confirmation: true}` sin ejecutar nada, y solo actúa
 cuando se la vuelve a llamar con el flag de confirmación (`force_execute` /
-`force_delete`) tras una respuesta afirmativa explícita del usuario.
+`force_delete` / `force_update`) tras una respuesta afirmativa explícita del usuario.
 
 El agente debe, en ese primer paso:
-1. Mostrar qué se va a hacer y sobre qué (título de la tarea, o tarea + carpeta).
+1. Mostrar qué se va a hacer y sobre qué (título de la tarea, tarea + carpeta, o precio actual y resultante).
 2. Preguntar explícitamente si se confirma.
 3. Solo entonces llamar de nuevo con el flag.
 

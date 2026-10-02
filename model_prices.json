@@ -1,0 +1,27 @@
+{
+  "_comentario": "Precios de modelos de IA en USD por millon de tokens (web_search_per_1k: USD por 1000 busquedas). Son DATOS, no codigo: se cargan en la tabla model_prices al arrancar, solo los (provider, model) que aun no existan. Para cambiar un precio que ya esta en la tabla usa la tool actualizar_precio_ia, o edita aqui y borra la fila. cache_write es la tarifa de escritura de cache de 5 minutos.",
+  "prices": [
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "input_per_mtok": 3.00,
+      "output_per_mtok": 15.00,
+      "cache_write_per_mtok": 3.75,
+      "cache_read_per_mtok": 0.30,
+      "web_search_per_1k": 10.00,
+      "checked_at": "2026-10-02",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "input_per_mtok": 1.00,
+      "output_per_mtok": 5.00,
+      "cache_write_per_mtok": 1.25,
+      "cache_read_per_mtok": 0.10,
+      "web_search_per_1k": 10.00,
+      "checked_at": "2026-10-02",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing"
+    }
+  ]
+}

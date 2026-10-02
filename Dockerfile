@@ -20,6 +20,8 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 
 COPY *.py .
 COPY AGENT_CAPABILITIES.md .
+# Datos, no codigo: siembra la tabla model_prices al arrancar (ver model_prices.py).
+COPY model_prices.json .
 
 RUN useradd -m botuser && chown -R botuser:botuser /app \
     && su botuser -c "git config --global user.email 'juan.foncuberta@gmail.com'" \
