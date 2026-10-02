@@ -581,3 +581,178 @@ class TestDigitalOceanSummary:
         _fecha_fija(monkeypatch, date(2026, 9, 7))
         self._con_balance(monkeypatch, {"month_to_date_usage": "1.00"})
         assert main._digitalocean_summary()["projected_month_end_usage"] == 4.29
+
+
+# ===========================================================================
+# PRIORIDAD 3 — resto del dispatch de execute_tool
+# ===========================================================================
+
+
+class _DispatchBase:
+    """Sustituye el proveedor y la vinculacion topic->proyecto por mocks."""
+
+    @pytest.fixture(autouse=True)
+    def _mocks(self, monkeypatch):
+        self.provider = MagicMock()
+        self.provider.resolve_project.return_value = {"id": "p9", "name": "Cuoco"}
+        self.get_project_id = MagicMock(return_value="p1")
+        self.set_project_id = MagicMock()
+        monkeypatch.setattr(main, "provider", self.provider)
+        monkeypatch.setattr(main, "get_project_id", self.get_project_id)
+        monkeypatch.setattr(main, "set_project_id", self.set_project_id)
+
+
+class TestVincularProyecto(_DispatchBase):
+    def test_resuelve_el_proyecto_y_lo_vincula_al_topic(self):
+        res = main.execute_tool("vincular_proyecto", {"project_name": "cuoco"}, 111, 7)
+
+        self.provider.resolve_project.assert_called_once_with("cuoco")
+        self.set_project_id.assert_called_once_with(111, 7, "p9", "Cuoco")
+        assert res == {"status": "ok", "project_id": "p9", "project_name": "Cuoco"}
+
+    def test_chat_sin_topic_vincula_con_thread_none(self):
+        main.execute_tool("vincular_proyecto", {"project_name": "cuoco"}, 111, None)
+        self.set_project_id.assert_called_once_with(111, None, "p9", "Cuoco")
+
+
+class TestListarProyectos(_DispatchBase):
+    def test_devuelve_lo_que_da_el_proveedor(self):
+        self.provider.list_projects.return_value = [{"id": "p1", "name": "Trabajo"}]
+
+        res = main.execute_tool("listar_proyectos", {}, 111, None)
+
+        assert res == [{"id": "p1", "name": "Trabajo"}]
+        self.set_project_id.assert_not_called()
+
+
+class TestCrearTarea(_DispatchBase):
+    def test_sin_proyecto_usa_el_vinculado_al_topic(self):
+        main.execute_tool("crear_tarea", {"content": "Comprar pan"}, 111, 7)
+
+        self.get_project_id.assert_called_once_with(111, 7)
+        self.provider.resolve_project.assert_not_called()
+        self.provider.create_task.assert_called_once_with(
+            content="Comprar pan", due_string=None, priority=1, project_id="p1"
+        )
+
+    def test_con_proyecto_explicito_lo_usa_sin_cambiar_la_vinculacion(self):
+        main.execute_tool("crear_tarea", {"content": "x", "project": "Cuoco"}, 111, 7)
+
+        self.provider.resolve_project.assert_called_once_with("Cuoco")
+        self.get_project_id.assert_not_called()
+        self.set_project_id.assert_not_called()
+        assert self.provider.create_task.call_args.kwargs["project_id"] == "p9"
+
+    def test_pasa_fecha_y_prioridad(self):
+        main.execute_tool(
+            "crear_tarea", {"content": "x", "date": "mañana", "priority": 4}, 111, None
+        )
+        self.provider.create_task.assert_called_once_with(
+            content="x", due_string="mañana", priority=4, project_id="p1"
+        )
+
+    def test_topic_sin_proyecto_vinculado_pasa_project_id_none(self):
+        # Comportamiento actual: no se bloquea, la tarea va a donde decida el
+        # proveedor sin project_id. El system prompt es quien pide vincular antes.
+        self.get_project_id.return_value = None
+
+        main.execute_tool("crear_tarea", {"content": "x"}, 111, None)
+
+        assert self.provider.create_task.call_args.kwargs["project_id"] is None
+
+    def test_devuelve_lo_que_da_el_proveedor(self):
+        self.provider.create_task.return_value = {"id": "t1", "content": "x"}
+        assert main.execute_tool("crear_tarea", {"content": "x"}, 111, None) == {
+            "id": "t1",
+            "content": "x",
+        }
+
+
+class TestListarTareas(_DispatchBase):
+    def test_sin_proyecto_usa_el_vinculado_al_topic(self):
+        self.provider.list_tasks.return_value = [{"id": "t1"}]
+
+        res = main.execute_tool("listar_tareas", {}, 111, 7)
+
+        self.get_project_id.assert_called_once_with(111, 7)
+        self.provider.list_tasks.assert_called_once_with(project_id="p1")
+        assert res == [{"id": "t1"}]
+
+    def test_con_proyecto_explicito_lo_usa_sin_cambiar_la_vinculacion(self):
+        main.execute_tool("listar_tareas", {"project": "Cuoco"}, 111, 7)
+
+        self.provider.resolve_project.assert_called_once_with("Cuoco")
+        self.get_project_id.assert_not_called()
+        self.set_project_id.assert_not_called()
+        self.provider.list_tasks.assert_called_once_with(project_id="p9")
+
+
+class TestCompletarTarea(_DispatchBase):
+    def test_cierra_la_tarea_en_el_proveedor(self):
+        res = main.execute_tool("completar_tarea", {"task_id": "t1"}, 111, None)
+
+        self.provider.close_task.assert_called_once_with("t1")
+        self.provider.delete_task.assert_not_called()
+        assert res == {"status": "completada"}
+
+
+class TestFuentesDeContenido:
+    @pytest.fixture(autouse=True)
+    def _mocks(self, monkeypatch):
+        self.add = MagicMock(return_value={"status": "ok"})
+        self.listar = MagicMock(return_value=[{"name": "One Useful Thing"}])
+        self.desactivar = MagicMock(return_value={"status": "desactivada"})
+        monkeypatch.setattr(main, "add_content_source", self.add)
+        monkeypatch.setattr(main, "list_content_sources", self.listar)
+        monkeypatch.setattr(main, "deactivate_content_source", self.desactivar)
+
+    def test_anadir_pasa_nombre_url_y_tipo(self):
+        res = main.execute_tool(
+            "anadir_fuente_contenido",
+            {"name": "OUT", "url": "https://www.oneusefulthing.org/feed", "type": "rss"},
+            111, None,
+        )
+        self.add.assert_called_once_with("OUT", "https://www.oneusefulthing.org/feed", "rss")
+        assert res == {"status": "ok"}
+
+    def test_listar_devuelve_las_activas(self):
+        assert main.execute_tool("listar_fuentes_contenido", {}, 111, None) == [
+            {"name": "One Useful Thing"}
+        ]
+
+    def test_desactivar_por_nombre(self):
+        res = main.execute_tool("desactivar_fuente_contenido", {"name": "OUT"}, 111, None)
+        self.desactivar.assert_called_once_with("OUT")
+        assert res == {"status": "desactivada"}
+
+
+class TestConsultarGastoDigitalOcean:
+    def test_delega_en_el_resumen(self, monkeypatch):
+        monkeypatch.setattr(main, "_digitalocean_summary", lambda: {"month_to_date_usage": "3"})
+        assert main.execute_tool("consultar_gasto_digitalocean", {}, 111, None) == {
+            "month_to_date_usage": "3"
+        }
+
+
+def test_todas_las_tools_declaradas_tienen_rama_en_execute_tool(monkeypatch):
+    """
+    Una tool en TOOLS sin rama en execute_tool acaba en ValueError('Herramienta
+    desconocida') en produccion. web_search la ejecuta la API, no execute_tool.
+    """
+    for nombre in ("provider", "todoist_client", "get_project_id", "set_project_id",
+                   "set_project_directory", "get_project_directory", "check_git_status",
+                   "cc_execute_task_on_branch", "add_content_source",
+                   "list_content_sources", "deactivate_content_source",
+                   "_digitalocean_summary"):
+        monkeypatch.setattr(main, nombre, MagicMock())
+
+    for tool in main.TOOLS:
+        if tool["name"] == "web_search":
+            continue
+        entrada = {
+            clave: "x" for clave in tool["input_schema"].get("properties", {})
+        }
+        try:
+            main.execute_tool(tool["name"], entrada, 111, None)
+        except ValueError as exc:
+            assert "desconocida" not in str(exc), f"{tool['name']} no tiene rama"
