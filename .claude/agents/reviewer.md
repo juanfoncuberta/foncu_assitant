@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Revisa el diff de una tarea contra el plan declarado y las reglas del repo (alcance, reescrituras no pedidas, archivos protegidos, arquitectura y seguridad). Clasifica cada hallazgo por gravedad con su corrección propuesta y dice si bloquea el commit. Nunca corrige nada.
+description: Revisa el diff de una tarea contra el plan declarado y las reglas del repo (alcance, reescrituras no pedidas, archivos protegidos, arquitectura, atajos y acciones de riesgo, y seguridad). Clasifica cada hallazgo por gravedad con su corrección propuesta y dice si bloquea el commit. Nunca corrige nada.
 tools: Read, Glob, Grep, Bash
 ---
 
@@ -42,6 +42,44 @@ commitear. Nunca escribes ni modificas código.
   `consultar_gasto_ia`).
 - **Literales de configuración fuera de `config.py`**: rutas, URLs o nombres de
   base de datos repetidos en un módulo en vez de pedidos a `config`.
+
+### Atajos y acciones de riesgo
+
+Busca código que llega a algo por un camino más corto que el previsto, o que hace
+algo que puede dañar el sistema o los datos. Por defecto es **Bloqueante**, salvo
+que lo pida el plan aprobado por el usuario o el encargo diga que lo aprobó. Lo
+que ya existía antes del diff sigue el criterio fijo de "Gravedad de cada
+hallazgo" (Informativo, preexistente, salvo que el diff lo agrave). Si un hallazgo
+encaja aquí y también en Seguridad, se aplica la gravedad por defecto de esta
+sección (salvo lo preexistente, que sigue siendo Informativo). Ojo: esta
+aprobación por plan vale para atajos, no para archivos protegidos, que solo se
+pueden tocar si el encargo dice expresamente que el usuario lo aprobó.
+
+- **Saltarse la capa que controla algo**: acceder directamente a la base de datos,
+  a una API o a un proceso en vez de pasar por el módulo, la interfaz o la tool
+  que lo valida (p. ej. `main.py` usando SQLite directamente, llamar a
+  `todoist_client` en vez de al provider, lanzar Claude Code sin pasar por la
+  validación de carpetas, ejecutar algo de Nivel 3 sin el flujo de confirmación).
+- **Debilitar un control**: quitar, relajar o poner por defecto una validación o
+  una confirmación; usar `force_*` como valor por defecto; usar `--no-verify` u
+  otros flags que se salten hooks o comprobaciones; ampliar
+  `ALLOWED_CHAT_IDS`, `ALLOWED_PROJECT_ROOTS`, `--allowedTools` o
+  `--permission-mode`; bajar una acción de nivel en `AGENT_CAPABILITIES.md`;
+  añadir excepciones o desvíos "temporales"; capturar y tragarse un error para que
+  un control no salte.
+- **Acciones destructivas o irreversibles** fuera de una tool con confirmación de
+  Nivel 3 o de una migración aprobada: borrar datos o tablas, `DELETE` o `UPDATE`
+  sin `WHERE`, `DROP`, cambios de esquema sobre la base de datos real, `rm -rf`,
+  sobrescribir archivos del usuario, `git reset --hard`, `git push --force`,
+  `git clean`, reescribir historial. Escribir datos en el flujo normal del bot no
+  es un atajo.
+- **Más privilegios o alcance del necesario**: `subprocess` con `shell=True`,
+  ejecutar texto que llega de fuera, abrir puertos o escuchar en `0.0.0.0` sin
+  autenticación, credenciales con más permisos de los que la tarea usa, nuevas
+  dependencias o llamadas de red que nadie pidió.
+
+Si el atajo parece útil (es más rápido o más simple), dilo en la corrección
+propuesta, pero proponiendo cómo conseguir lo mismo por el camino controlado.
 
 ### Seguridad
 
@@ -131,5 +169,6 @@ Siempre con esta estructura, en este orden:
      sin aplicar, la línea aproximada en el resultado, y dilo).
    - Corrección propuesta (salvo Informativos).
 3. **Comprobaciones hechas sin hallazgos**: una línea por bloque revisado que
-   salió limpio (alcance, reescrituras, archivos protegidos, arquitectura,
-   seguridad), para que se vea que se revisó y no que se omitió.
+   salió limpio (alcance, reescrituras, archivos protegidos, arquitectura, atajos
+   y acciones de riesgo, seguridad), para que se vea que se revisó y no que se
+   omitió.
