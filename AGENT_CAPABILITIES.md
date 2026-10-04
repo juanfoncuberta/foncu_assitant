@@ -47,7 +47,7 @@ El agente ejecuta sin pedir permiso previo, pero **siempre** informa del resulta
 | Acción               | Condición para ejecución autónoma                                      |
 |----------------------|------------------------------------------------------------------------|
 | `ejecutar_tarea_dev` | **Solo** cuando `directory_path` es un repositorio Git **Y** el árbol de trabajo está limpio (sin cambios sin commitear) antes de empezar |
-| `vincular_carpeta_proyecto` | Asocia una carpeta del servidor a un proyecto. No modifica nada por sí sola, pero determina dónde se ejecutará Claude Code después — por eso se valida contra `ALLOWED_PROJECT_ROOTS` y se informa siempre de qué carpeta quedó vinculada |
+| `vincular_carpeta_proyecto` | Asocia una carpeta del servidor a un proyecto. No modifica nada por sí sola, pero determina dónde se ejecutará Claude Code después — por eso se valida contra `ALLOWED_PROJECT_ROOTS` (al vincular y otra vez antes de cada `ejecutar_tarea_dev`, sobre la ruta ya resuelta) y se informa siempre de qué carpeta quedó vinculada |
 
 **Aviso posterior obligatorio incluye:** resultado de la ejecución, diff generado (git diff),
 coste en USD, session_id y el informe del subagent `reviewer`, que compara el diff real

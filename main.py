@@ -662,9 +662,9 @@ def _validate_project_directory(directory_path: str) -> str | None:
     Comprueba que una carpeta puede vincularse a un proyecto.
     Devuelve el motivo del rechazo, o None si es valida.
 
-    Esta carpeta determina donde se ejecutara Claude Code mas adelante, asi que
-    se valida aqui y no en el momento de ejecutar: un fallo en este punto es
-    barato, y uno en ejecutar_tarea_dev ya no.
+    Esta carpeta determina donde se ejecutara Claude Code, asi que se valida dos
+    veces: al vincularla (un fallo ahi es barato) y otra vez justo antes de cada
+    ejecutar_tarea_dev (por si la carpeta, un symlink o las raices cambiaron).
     """
     if not directory_path or not os.path.isabs(directory_path):
         return "La ruta debe ser absoluta (empezar por '/')."
@@ -756,9 +756,20 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
         return deactivate_content_source(tool_input["name"])
 
     if name == "vincular_carpeta_proyecto":
-        directory_path = tool_input["directory_path"]
+        escrita = tool_input["directory_path"]
+        if not escrita or not os.path.isabs(escrita):
+            return {"error": _validate_project_directory(escrita)}
+        # Se guarda la ruta resuelta, no la escrita: si era un symlink y luego se
+        # redirige, lo vinculado sigue siendo la carpeta que se valido. (El validador
+        # vuelve a resolver por dentro; si algo cambiara justo entre esas dos llamadas,
+        # es la misma ventana estructural que se acepta al ejecutar.)
+        directory_path = os.path.realpath(escrita)
         rechazo = _validate_project_directory(directory_path)
         if rechazo:
+            if directory_path != escrita:
+                # El mensaje habla de la ruta resuelta; se anade la que escribio el
+                # usuario para que entienda de donde sale.
+                rechazo = f"La ruta indicada '{escrita}' lleva a '{directory_path}'. {rechazo}"
             return {"error": rechazo}
 
         set_project_directory(tool_input["project_id"], directory_path)
@@ -767,7 +778,7 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
             "project_id": tool_input["project_id"],
             "directory_path": directory_path,
         }
-        if not os.path.isdir(os.path.join(os.path.realpath(directory_path), ".git")):
+        if not os.path.isdir(os.path.join(directory_path, ".git")):
             respuesta["aviso"] = (
                 "La carpeta no es un repositorio Git. Se ha vinculado igualmente, pero "
                 "ejecutar_tarea_dev pedira confirmacion explicita cada vez, porque sin "
@@ -781,14 +792,26 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
         project_id = task.get("project_id")
         if not project_id:
             return {"error": "La tarea no tiene project_id asociado."}
-        directory_path = get_project_directory(project_id)
-        if not directory_path:
+        vinculada = get_project_directory(project_id)
+        if not vinculada:
             return {
                 "error": (
                     f"El proyecto {project_id} no tiene una carpeta vinculada. "
                     "Usa vincular_carpeta_proyecto primero."
                 )
             }
+        # Se revalida AHORA, no solo al vincular: entre una cosa y otra pueden haber
+        # cambiado la carpeta, un symlink o ALLOWED_PROJECT_ROOTS. Tambien protege
+        # las rutas guardadas antes de que se guardaran resueltas. Se usa la ruta
+        # resuelta aqui, no la guardada. Va antes de mirar Git y antes de
+        # force_execute: confirmar no puede saltarse este limite. Queda una ventana
+        # conocida y aceptada: el executor vuelve a usar esta ruta durante minutos.
+        directory_path = os.path.realpath(vinculada) if os.path.isabs(vinculada) else vinculada
+        rechazo = _validate_project_directory(directory_path)
+        if rechazo:
+            if directory_path != vinculada:
+                rechazo = f"La carpeta vinculada '{vinculada}' lleva a '{directory_path}'. {rechazo}"
+            return {"error": f"No se ejecuta: {rechazo}"}
         force = tool_input.get("force_execute", False)
         if not force:
             git = check_git_status(directory_path)

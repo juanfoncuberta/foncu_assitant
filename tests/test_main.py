@@ -439,10 +439,15 @@ class TestEliminarTarea:
 
 class TestEjecutarTareaDev:
     @pytest.fixture(autouse=True)
-    def _mocks(self, monkeypatch):
+    def _mocks(self, monkeypatch, tmp_path):
+        # Carpeta real dentro de una raiz permitida: ejecutar_tarea_dev la revalida.
+        raiz = tmp_path.resolve() / "proyectos"
+        self.dir = str(raiz / "app")
+        (raiz / "app").mkdir(parents=True)
+        monkeypatch.setenv("ALLOWED_PROJECT_ROOTS", str(raiz))
         self.todoist = MagicMock()
         self.todoist.get_task.return_value = {"content": "anade un test", "project_id": "p1"}
-        self.get_dir = MagicMock(return_value="/opt/app")
+        self.get_dir = MagicMock(return_value=self.dir)
         self.git = MagicMock(return_value={"is_git": True, "is_clean": True})
         self.ejecutar = MagicMock(return_value={"status": "ok", "git_diff": ""})
         self.provider = MagicMock()
@@ -459,7 +464,7 @@ class TestEjecutarTareaDev:
     def test_repo_limpio_ejecuta(self):
         res = self._llamar()
         assert res == {"status": "ok", "git_diff": ""}
-        self.ejecutar.assert_called_once_with("anade un test", "/opt/app")
+        self.ejecutar.assert_called_once_with("anade un test", self.dir)
 
     def test_no_consulta_el_gestor_de_tareas_para_el_nombre_del_proyecto(self):
         # El gasto se imputa con el nombre de la carpeta: no hace falta otra llamada.
@@ -764,3 +769,164 @@ def test_todas_las_tools_declaradas_tienen_rama_en_execute_tool(monkeypatch):
             main.execute_tool(tool["name"], entrada, 111, None)
         except ValueError as exc:
             assert "desconocida" not in str(exc), f"{tool['name']} no tiene rama"
+
+
+# ===========================================================================
+# TOCTOU de carpetas de proyecto: la validacion de vincular_carpeta_proyecto
+# tiene que seguir valiendo en el momento de ejecutar
+# ===========================================================================
+
+
+class TestToctouCarpetaDeProyecto:
+    """
+    El ataque: se vincula una carpeta que es un symlink y apunta DENTRO de las
+    raices permitidas (pasa la validacion); despues alguien redirige el symlink
+    FUERA. Si se guardo la ruta sin resolver y no se revalida al ejecutar, Claude
+    Code acaba trabajando fuera de las raices.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _entorno(self, tmp_path, monkeypatch):
+        base = tmp_path.resolve()
+        self.raiz = base / "proyectos"
+        self.dentro = self.raiz / "app"
+        self.fuera = base / "fuera"
+        for d in (self.dentro, self.fuera):
+            d.mkdir(parents=True)
+        self.alias = self.raiz / "alias"
+        self.alias.symlink_to(self.dentro, target_is_directory=True)
+        monkeypatch.setenv("ALLOWED_PROJECT_ROOTS", str(self.raiz))
+
+        todoist = MagicMock()
+        todoist.get_task.return_value = {"content": "tarea", "project_id": "p1"}
+        self.git = MagicMock(return_value={"is_git": True, "is_clean": True})
+        self.ejecutar = MagicMock(return_value={"status": "ok"})
+        monkeypatch.setattr(main, "todoist_client", todoist)
+        monkeypatch.setattr(main, "check_git_status", self.git)
+        monkeypatch.setattr(main, "cc_execute_task_on_branch", self.ejecutar)
+
+    def _redirigir_alias_fuera(self):
+        self.alias.unlink()
+        self.alias.symlink_to(self.fuera, target_is_directory=True)
+
+    def _ejecutar(self, **extra):
+        return main.execute_tool("ejecutar_tarea_dev", {"task_id": "t1", **extra}, 111, None)
+
+    def test_vincular_guarda_la_ruta_resuelta_no_el_symlink(self):
+        res = main.execute_tool(
+            "vincular_carpeta_proyecto",
+            {"project_id": "p1", "directory_path": str(self.alias)},
+            111, None,
+        )
+
+        assert res["status"] == "ok"
+        assert main.get_project_directory("p1") == str(self.dentro)
+        assert res["directory_path"] == str(self.dentro)
+
+    def test_redirigir_el_symlink_despues_de_vincular_no_saca_la_ejecucion_fuera(self):
+        main.execute_tool(
+            "vincular_carpeta_proyecto",
+            {"project_id": "p1", "directory_path": str(self.alias)},
+            111, None,
+        )
+        self._redirigir_alias_fuera()
+
+        self._ejecutar()
+
+        ruta = self.ejecutar.call_args.args[1]
+        assert ruta == str(self.dentro)
+        assert not ruta.startswith(str(self.fuera))
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_ruta_guardada_que_ya_apunta_fuera_no_se_ejecuta(self, force):
+        # Una fila guardada antes de este arreglo (con el symlink sin resolver).
+        main.set_project_directory("p1", str(self.alias))
+        self._redirigir_alias_fuera()
+
+        res = self._ejecutar(force_execute=force)
+
+        assert "fuera de las raices" in res["error"]
+        assert str(self.alias) in res["error"]  # que se vea que ruta habia guardada
+        self.ejecutar.assert_not_called()
+        self.git.assert_not_called()
+
+    def test_ruta_guardada_valida_se_ejecuta_sobre_la_ruta_resuelta(self):
+        main.set_project_directory("p1", str(self.alias))
+
+        self._ejecutar()
+
+        self.git.assert_called_once_with(str(self.dentro))
+        assert self.ejecutar.call_args.args[1] == str(self.dentro)
+
+    def test_carpeta_borrada_despues_de_vincular_no_se_ejecuta(self):
+        main.set_project_directory("p1", str(self.dentro))
+        self.dentro.rmdir()
+
+        res = self._ejecutar(force_execute=True)
+
+        assert "no existe" in res["error"]
+        self.ejecutar.assert_not_called()
+
+    def test_raices_reducidas_despues_de_vincular_no_se_ejecuta(self, monkeypatch, tmp_path):
+        # Si se estrecha ALLOWED_PROJECT_ROOTS, lo vinculado antes deja de valer.
+        main.set_project_directory("p1", str(self.dentro))
+        otra = tmp_path.resolve() / "otra_raiz"
+        otra.mkdir()
+        monkeypatch.setenv("ALLOWED_PROJECT_ROOTS", str(otra))
+
+        res = self._ejecutar(force_execute=True)
+
+        assert "fuera de las raices" in res["error"]
+        self.ejecutar.assert_not_called()
+
+    def test_symlink_en_un_componente_intermedio_redirigido_fuera_no_se_ejecuta(self):
+        # El symlink no es la carpeta final sino un directorio de mas arriba.
+        (self.fuera / "app").mkdir()
+        intermedio = self.raiz / "grupo"
+        intermedio.symlink_to(self.dentro.parent, target_is_directory=True)
+        main.set_project_directory("p1", str(intermedio / "app"))  # fila antigua
+        intermedio.unlink()
+        intermedio.symlink_to(self.fuera, target_is_directory=True)
+
+        res = self._ejecutar(force_execute=True)
+
+        assert "fuera de las raices" in res["error"]
+        self.ejecutar.assert_not_called()
+
+    def test_vincular_un_alias_imputa_el_gasto_a_la_carpeta_real(self):
+        # Efecto buscado: el nombre del proyecto es el de la carpeta de verdad.
+        import project_directory_map as pdm
+        main.execute_tool(
+            "vincular_carpeta_proyecto",
+            {"project_id": "p1", "directory_path": str(self.alias)},
+            111, None,
+        )
+        assert pdm.label_for_directory(main.get_project_directory("p1")) == "app"
+
+    @pytest.mark.parametrize("ruta", ["", "relativa/app"])
+    def test_vincular_ruta_relativa_sigue_rechazandose(self, ruta):
+        res = main.execute_tool(
+            "vincular_carpeta_proyecto", {"project_id": "p1", "directory_path": ruta}, 111, None
+        )
+        assert "absoluta" in res["error"]
+
+    def test_ruta_relativa_guardada_con_datos_antiguos_no_se_ejecuta(self):
+        main.set_project_directory("p1", "proyectos/app")
+
+        res = self._ejecutar(force_execute=True)
+
+        assert "absoluta" in res["error"]
+        self.ejecutar.assert_not_called()
+
+    def test_el_error_de_vincular_muestra_la_ruta_escrita_y_a_donde_lleva(self):
+        self._redirigir_alias_fuera()
+
+        res = main.execute_tool(
+            "vincular_carpeta_proyecto",
+            {"project_id": "p1", "directory_path": str(self.alias)},
+            111, None,
+        )
+
+        assert str(self.alias) in res["error"]  # lo que escribio el usuario
+        assert str(self.fuera) in res["error"]  # a donde lleva de verdad
+        assert "fuera de las raices" in res["error"]
