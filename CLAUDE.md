@@ -124,10 +124,17 @@ flujo), ningún commit se hace sin este orden:
 1. `pytest` completo en verde.
 2. El subagent `reviewer` revisa el diff contra lo que pidió el usuario. Se le da
    el plan, no la explicación de cómo se hizo: si revisa el mismo agente que
-   escribió el código, no hay revisión.
-3. Se presenta al usuario el resumen de los cambios y el informe del `reviewer`
+   escribió el código, no hay revisión. En el encargo se le dice qué archivos
+   protegidos aprobó tocar el usuario, para que no los cuente como bloqueantes.
+3. Se corrigen los Bloqueantes y los "A corregir" cuya corrección cabe en el plan,
+   y se vuelve al paso 1. No se presenta como terminado algo con Bloqueantes.
+   Excepción: si una corrección se sale del plan, exige tocar un archivo protegido
+   sin aprobación o el hallazgo parece un falso positivo, se para y se presenta al
+   usuario tal cual. Nunca se aplica una corrección propuesta que salga del plan
+   sin su confirmación (ver el incidente de `semantic_memory.py`).
+4. Se presenta al usuario el resumen de los cambios y el informe del `reviewer`
    tal cual, sin filtrar los hallazgos.
-4. Se commitea solo tras su confirmación explícita. Hasta entonces los cambios se
+5. Se commitea solo tras su confirmación explícita. Hasta entonces los cambios se
    quedan sin commitear en la rama de trabajo.
 
 ## Reintentos
