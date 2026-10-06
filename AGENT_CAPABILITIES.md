@@ -37,6 +37,7 @@ al usuario antes ni después, salvo que el resultado en sí sea la respuesta esp
 | `consultar_gasto_digitalocean` | Solo lectura sobre la API de DigitalOcean   |
 | `consultar_gasto_ia` | Solo lectura sobre `usage_log` (gasto en IA, cualquier proveedor) |
 | `consultar_precios_ia` | Solo lectura sobre `model_prices` |
+| `listar_ramas_sin_revisar` | Solo lectura sobre `dev_log` y git (ramas de `ejecutar_tarea_dev` sin revisión completa ni integrar) |
 
 ---
 
@@ -46,12 +47,22 @@ El agente ejecuta sin pedir permiso previo, pero **siempre** informa del resulta
 
 | Acción               | Condición para ejecución autónoma                                      |
 |----------------------|------------------------------------------------------------------------|
-| `ejecutar_tarea_dev` | **Solo** cuando `directory_path` es un repositorio Git **Y** el árbol de trabajo está limpio (sin cambios sin commitear) antes de empezar |
+| `ejecutar_tarea_dev` | **Solo** cuando `directory_path` es un repositorio Git **Y** el árbol de trabajo está limpio (sin cambios sin commitear) antes de empezar. Si el repo está en detached HEAD (sin rama activa) no se ejecuta: no habría base contra la que revisar |
+| `revisar_rama_dev` | La rama está en `dev_log` con su carpeta y rama base, y la carpeta sigue pasando la validación de `ALLOWED_PROJECT_ROOTS` (resuelta, igual que antes de `ejecutar_tarea_dev`). Solo lectura, pero lanza Claude Code y tiene coste |
 | `vincular_carpeta_proyecto` | Asocia una carpeta del servidor a un proyecto. No modifica nada por sí sola, pero determina dónde se ejecutará Claude Code después — por eso se valida contra `ALLOWED_PROJECT_ROOTS` (al vincular y otra vez antes de cada `ejecutar_tarea_dev`, sobre la ruta ya resuelta) y se informa siempre de qué carpeta quedó vinculada |
 
-**Aviso posterior obligatorio incluye:** resultado de la ejecución, diff generado (git diff),
-coste en USD, session_id y el informe del subagent `reviewer`, que compara el diff real
-contra el plan declarado antes de empezar. La tarea de Todoist **nunca** se marca como completada
+**Aviso posterior obligatorio incluye:** resultado de la ejecución, diff generado (git diff,
+recortado para mostrarlo; el `reviewer` revisa el completo), coste en USD, session_id y el
+informe del subagent `reviewer`, que compara el diff real contra el plan declarado antes de
+empezar. La primera línea del informe dice cuántos archivos revisó de los que cambiaron.
+
+La revisión es obligatoria. Si falla o queda incompleta, se repite una vez sola; si
+tampoco sale (o el reviewer está desactivado), `revision_valida` es false y el informe
+empieza por "❌ NO REVISADA". En ese caso, también en `revisar_rama_dev`, la respuesta al
+usuario **empieza** por ese aviso, tal cual, y la tarea no se presenta como lista para
+integrar. El código lo antepone igualmente si el modelo no lo pone. Se le ofrece volver a revisarla con `revisar_rama_dev`.
+
+La tarea de Todoist **nunca** se marca como completada
 automáticamente — esa decisión la toma el usuario.
 
 ---

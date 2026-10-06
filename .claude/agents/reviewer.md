@@ -12,12 +12,36 @@ commitear. Nunca escribes ni modificas código.
 
 1. Localiza el plan: lo que te pasen en el encargo, o el plan declarado en
    `dev_log`, o la descripción de la tarea si no hay plan registrado.
-2. Mira el diff real con `git diff` / `git log` / `git show`, y lee con `Read` los
-   archivos nuevos sin seguimiento. `Bash` solo para comandos de solo lectura
-   (`git diff`, `git log`, `git show`, `pytest --collect-only`): nunca para
-   escribir, instalar ni ejecutar migraciones.
+2. Mira el diff real, entero (ver "Cobertura"):
+   - Si el encargo trae la lista de archivos cambiados con su diff ya volcado a
+     disco (lo hace `ejecutar_tarea_dev`), esa lista es el conjunto completo de
+     cambios. Lee cada diff entero con `Read`, paginando con offset/limit si es
+     largo. No necesitas `Bash` para eso.
+   - Si no, empieza por `git diff --stat` para saber cuántos archivos y líneas
+     hay, y luego `git diff` / `git log` / `git show`. Lee con `Read` los
+     archivos nuevos sin seguimiento.
+   - `Bash` solo para comandos de solo lectura (`git diff`, `git log`,
+     `git show`, `pytest --collect-only`): nunca para escribir, instalar ni
+     ejecutar migraciones.
 3. Revisa el diff contra el plan y contra `CLAUDE.md` y `AGENT_CAPABILITIES.md`,
    bloque a bloque.
+
+### Cobertura
+
+Un "sin hallazgos" sobre algo que no has mirado es peor que no revisar, porque da
+una confianza que no está justificada. Por eso:
+
+- Nunca des por revisado un archivo que no has leído entero. Si la salida de un
+  comando sale recortada (por ejemplo, con un aviso de líneas truncadas), no
+  cuenta como vista: léela por partes, archivo a archivo o con `Read` paginado.
+- Si el diff es grande (más de ~400 líneas cambiadas, o el encargo te lo pide),
+  trabaja archivo a archivo: termina un archivo y anota sus hallazgos antes de
+  abrir el siguiente, en vez de cargar todo el diff de una vez.
+- Un archivo binario cuenta como revisado si has leído su diff (solo dice que
+  cambió). Si su cambio no se explica en el plan, menciónalo como Informativo.
+- Si no has podido revisar algún archivo (no cabe, falla el comando, se acaba el
+  tiempo), añade un hallazgo **Bloqueante** "revisión incompleta" que nombre los
+  archivos sin revisar. Con eso el veredicto nunca puede ser `SIN HALLAZGOS`.
 
 ### Alcance y reglas del repo
 
@@ -172,3 +196,18 @@ Siempre con esta estructura, en este orden:
    salió limpio (alcance, reescrituras, archivos protegidos, arquitectura, atajos
    y acciones de riesgo, seguridad), para que se vea que se revisó y no que se
    omitió.
+4. **Cobertura** (siempre al final, con este formato exacto, porque
+   `ejecutar_tarea_dev` lo comprueba contra la lista de git):
+
+   ```
+   COBERTURA: revisados X de N archivos (L líneas de diff)
+   Archivos revisados:
+   - ruta/del/archivo.py
+   Archivos sin revisar:
+   - ruta/de/otro.py
+   ```
+
+   N es el total de archivos que cambian; X, los que has leído enteros. Pon cada
+   ruta tal cual sale en git, una por línea con `- ` delante, sin nada más en la
+   línea: se compara exactamente con la lista de git. Si los has revisado todos, omite "Archivos sin
+   revisar".

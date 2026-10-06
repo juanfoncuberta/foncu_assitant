@@ -28,7 +28,14 @@ import model_prices
 import provider_factory
 import todoist_client
 import usage_log
-from claude_code_executor import check_git_status, execute_task_on_branch as cc_execute_task_on_branch
+from claude_code_executor import (
+    check_git_status,
+    estado_rama as cc_estado_rama,
+    execute_task_on_branch as cc_execute_task_on_branch,
+    get_dev_log_entry as cc_get_dev_log_entry,
+    get_unreviewed_dev_log_entries as cc_get_unreviewed_dev_log_entries,
+    revisar_rama as cc_revisar_rama,
+)
 from content_sources import (
     add_source as add_content_source,
     deactivate_source as deactivate_content_source,
@@ -471,7 +478,8 @@ TOOLS = [
             "ejecuta directamente y devuelve el resultado con git_diff. Si no, devuelve "
             "{requires_confirmation: true} sin ejecutar; en ese caso pide confirmación al "
             "usuario y llama de nuevo con force_execute: true. Nunca completa la tarea "
-            "automáticamente tras la ejecución."
+            "automáticamente tras la ejecución. Si revision_valida es false, la tarea NO "
+            "está lista para integrar: empieza la respuesta con el aviso de la revisión."
         ),
         "input_schema": {
             "type": "object",
@@ -490,6 +498,33 @@ TOOLS = [
                 },
             },
             "required": ["task_id"],
+        },
+    },
+    {
+        "name": "listar_ramas_sin_revisar",
+        "description": (
+            "Lista las ramas de tareas de desarrollo (ejecutar_tarea_dev) que no tienen una "
+            "revisión completa y siguen sin integrar. Solo lectura."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "revisar_rama_dev",
+        "description": (
+            "Vuelve a pasar el reviewer sobre una rama creada por ejecutar_tarea_dev, sin "
+            "repetir la tarea. Solo lectura: no cambia de rama ni toca el código. Tarda "
+            "minutos y lanza Claude Code, así que tiene coste. Si revision_valida es false, "
+            "empieza la respuesta con el aviso de la revisión."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "branch": {
+                    "type": "string",
+                    "description": "Nombre exacto de la rama (p. ej. fix/algo-123456)",
+                },
+            },
+            "required": ["branch"],
         },
     },
     {
@@ -829,6 +864,46 @@ def execute_tool(name: str, tool_input: dict[str, Any], chat_id: int, thread_id:
                 }
         return cc_execute_task_on_branch(task_content, directory_path)
 
+    if name == "listar_ramas_sin_revisar":
+        ramas = []
+        for entrada in cc_get_unreviewed_dev_log_entries():
+            # Misma revalidacion que antes de ejecutar: solo se lanza git en carpetas
+            # que siguen dentro de las raices permitidas.
+            directory_path = os.path.realpath(entrada["directory"])
+            if _validate_project_directory(directory_path):
+                estado = "carpeta_no_permitida"
+            else:
+                estado = cc_estado_rama(directory_path, entrada["branch"], entrada["base_branch"])
+            if estado in ("integrada", "no_existe"):
+                continue
+            ramas.append({
+                "branch": entrada["branch"],
+                "tarea": entrada["task_content"],
+                "revision_estado": entrada["review_status"] or "sin_revisar",
+                "estado_rama": estado,
+                "creada": entrada["created_at"],
+            })
+        return {"ramas": ramas}
+
+    if name == "revisar_rama_dev":
+        entrada = cc_get_dev_log_entry(tool_input["branch"])
+        if entrada is None:
+            return {"error": f"No hay ninguna tarea de desarrollo con la rama {tool_input['branch']}."}
+        if not entrada["directory"] or not entrada["base_branch"]:
+            return {
+                "error": (
+                    "Esa tarea es anterior a que se guardaran su carpeta y su rama base: "
+                    "no se puede volver a revisar desde el bot."
+                )
+            }
+        # Se revalida como en ejecutar_tarea_dev: la ruta guardada puede haber dejado
+        # de estar permitida (o apuntar a otro sitio) desde que se ejecuto la tarea.
+        directory_path = os.path.realpath(entrada["directory"])
+        rechazo = _validate_project_directory(directory_path)
+        if rechazo:
+            return {"error": f"No se revisa: {rechazo}"}
+        return cc_revisar_rama(entrada, directory_path)
+
     if name == "consultar_gasto_digitalocean":
         return _digitalocean_summary()
 
@@ -965,6 +1040,27 @@ async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("Contexto borrado. Empezamos de cero.", message_thread_id=thread_id)
 
 
+def _aviso_de_revision(result: Any) -> str | None:
+    """
+    Primera linea del informe de revision cuando la rama NO tiene una revision valida
+    (ejecutar_tarea_dev / revisar_rama_dev con revision_valida false). Es un control:
+    que el aviso llegue no puede depender de que el modelo del chat lo copie.
+    """
+    if not isinstance(result, dict) or result.get("revision_valida") is not False:
+        return None
+    texto = (result.get("review") or result.get("error") or "").strip()
+    primera = texto.splitlines()[0] if texto else ""
+    return primera or "❌ NO REVISADA: la rama no tiene una revisión completa."
+
+
+def _anteponer_avisos(reply_text: str, avisos: list[str]) -> str:
+    """Pone delante los avisos que la respuesta del modelo no lleve ya al principio."""
+    faltan = [a for a in avisos if not reply_text.lstrip().startswith(a)]
+    if not faltan:
+        return reply_text
+    return "\n".join(faltan) + ("\n\n" + reply_text if reply_text else "")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.message.text
     chat_id = update.message.chat_id
@@ -999,6 +1095,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     messages: list[dict] = history + [{"role": "user", "content": user_text}]
     proyecto = await asyncio.to_thread(usage_log.project_of, get_project_label, chat_id, thread_id)
 
+    # Avisos de revision que tienen que ir al principio de la respuesta aunque el
+    # modelo los resuma o los omita (ver _aviso_de_revision).
+    avisos_revision: list[str] = []
     while True:
         # to_thread: el cliente de Anthropic es sincrono. Llamarlo directo desde un
         # handler async congela el event loop entero — el bot deja de responder a
@@ -1033,6 +1132,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "(plan, ejecución y revisión); te aviso al terminar.",
                     message_thread_id=thread_id,
                 )
+            if block.name == "revisar_rama_dev":
+                await update.message.reply_text(
+                    "Revisando la rama. Puede tardar varios minutos (más si hay que "
+                    "repetir la revisión); te aviso al terminar.",
+                    message_thread_id=thread_id,
+                )
 
             try:
                 # Igual que arriba: execute_tool es sincrono y ejecutar_tarea_dev
@@ -1043,6 +1148,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as exc:
                 logger.exception("Error ejecutando herramienta %s", block.name)
                 result = {"error": str(exc)}
+            aviso = _aviso_de_revision(result)
+            if aviso and aviso not in avisos_revision:
+                avisos_revision.append(aviso)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -1055,6 +1163,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply_text = "".join(
         block.text for block in response.content if block.type == "text"
     )
+    reply_text = _anteponer_avisos(reply_text, avisos_revision)
     await update.message.reply_text(reply_text, message_thread_id=thread_id)
 
     if reply_text:

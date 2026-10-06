@@ -85,6 +85,10 @@ class TestExecutor:
 
     def test_revision_apunta_review_con_la_rama(self, mocker, monkeypatch):
         monkeypatch.delenv("REVIEWER_ENABLED", raising=False)
+        # git (lista de archivos del diff) va por _git; aqui no hay cambios.
+        mocker.patch.object(
+            ce, "_git", side_effect=lambda args, *a, **k: (0, "0" if args[0] == "rev-list" else "", "")
+        )
         mocker.patch("subprocess.run", side_effect=_cli_ok)
         ce._run_reviewer("tarea", "plan", "feat/x-1", "main", "/repo")
         assert [(f["step"], f["origin"]) for f in _filas()] == [("review", "feat/x-1")]
@@ -100,6 +104,8 @@ class TestExecutor:
         def git_falso(args, cwd, timeout=30):
             if args[:2] == ["rev-parse", "--abbrev-ref"]:
                 return 0, "main", ""
+            if args[0] == "rev-list":
+                return 0, "0", ""
             return 0, "", ""
 
         mocker.patch.object(ce, "_git", side_effect=git_falso)

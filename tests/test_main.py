@@ -756,8 +756,10 @@ def test_todas_las_tools_declaradas_tienen_rama_en_execute_tool(monkeypatch):
                    "set_project_directory", "get_project_directory", "check_git_status",
                    "cc_execute_task_on_branch", "add_content_source",
                    "list_content_sources", "deactivate_content_source",
-                   "_digitalocean_summary"):
+                   "_digitalocean_summary", "cc_revisar_rama", "cc_estado_rama"):
         monkeypatch.setattr(main, nombre, MagicMock())
+    monkeypatch.setattr(main, "cc_get_unreviewed_dev_log_entries", MagicMock(return_value=[]))
+    monkeypatch.setattr(main, "cc_get_dev_log_entry", MagicMock(return_value=None))
 
     for tool in main.TOOLS:
         if tool["name"] == "web_search":
@@ -769,6 +771,160 @@ def test_todas_las_tools_declaradas_tienen_rama_en_execute_tool(monkeypatch):
             main.execute_tool(tool["name"], entrada, 111, None)
         except ValueError as exc:
             assert "desconocida" not in str(exc), f"{tool['name']} no tiene rama"
+
+
+class TestAvisoDeRevisionObligatorio:
+    """
+    Que una rama sin revision valida llegue avisada al usuario es un control: no puede
+    depender de que el modelo del chat copie el aviso.
+    """
+
+    def test_extrae_la_primera_linea_si_la_revision_no_es_valida(self):
+        res = {"revision_valida": False, "review": "❌ NO REVISADA: x\n- detalle"}
+        assert main._aviso_de_revision(res) == "❌ NO REVISADA: x"
+
+    def test_usa_el_error_si_no_hay_informe(self):
+        res = {"revision_valida": False, "error": "La rama ya está integrada en main"}
+        assert main._aviso_de_revision(res) == "La rama ya está integrada en main"
+
+    @pytest.mark.parametrize("res", [
+        {"revision_valida": True, "review": "Cobertura..."},
+        {"status": "ok"},  # otras tools no llevan revision
+        "texto",
+        None,
+    ])
+    def test_sin_aviso_si_la_revision_es_valida_o_no_aplica(self, res):
+        assert main._aviso_de_revision(res) is None
+
+    def test_antepone_el_aviso_si_el_modelo_no_lo_pone(self):
+        texto = main._anteponer_avisos("Hecho, todo bien.", ["❌ NO REVISADA: x"])
+        assert texto.startswith("❌ NO REVISADA: x")
+        assert texto.endswith("Hecho, todo bien.")
+
+    def test_no_lo_duplica_si_el_modelo_ya_empieza_por_el(self):
+        texto = "❌ NO REVISADA: x\n\nResto"
+        assert main._anteponer_avisos(texto, ["❌ NO REVISADA: x"]) == texto
+
+    def test_respuesta_vacia_queda_solo_el_aviso(self):
+        assert main._anteponer_avisos("", ["❌ NO REVISADA: x"]) == "❌ NO REVISADA: x"
+
+    def test_el_handler_antepone_el_aviso_aunque_el_modelo_lo_omita(self, monkeypatch):
+        from types import SimpleNamespace as NS
+        monkeypatch.setattr(main, "_autorizado", lambda chat_id: True, raising=False)
+        uso = NS(type="tool_use", name="revisar_rama_dev", input={"branch": "feat/x-1"}, id="t1")
+        respuestas = iter([
+            NS(stop_reason="tool_use", content=[uso]),
+            NS(stop_reason="end_turn", content=[NS(type="text", text="Revisada, sin problemas.")]),
+        ])
+        claude = MagicMock()
+        claude.messages.create.side_effect = lambda **kw: next(respuestas)
+        monkeypatch.setattr(main, "claude", claude)
+        monkeypatch.setattr(main, "execute_tool", MagicMock(return_value={
+            "revision_valida": False, "review": "❌ NO REVISADA: dos intentos fallidos"}))
+        for nombre in ("get_history", "get_summary", "search_similar", "add_message",
+                       "add_semantic_memory", "trim_and_summarize", "get_project_label"):
+            monkeypatch.setattr(main, nombre, MagicMock(return_value=[]), raising=False)
+        monkeypatch.setattr(main.usage_log, "record", MagicMock())
+        monkeypatch.setattr(main.usage_log, "project_of", MagicMock(return_value="p"))
+        update = _update_falso(int(os.environ["OWNER_CHAT_ID"]), "revisa la rama feat/x-1")
+        update.message.reply_text = AsyncMock()
+
+        asyncio.run(main.handle_message(update, _context_falso()))
+
+        final = update.message.reply_text.call_args_list[-1].args[0]
+        assert final.startswith("❌ NO REVISADA: dos intentos fallidos")
+        assert "Revisada, sin problemas." in final
+
+
+class TestRevisarRamaDev:
+    @pytest.fixture(autouse=True)
+    def _mocks(self, monkeypatch, tmp_path):
+        raiz = tmp_path.resolve() / "proyectos"
+        self.dir = str(raiz / "app")
+        (raiz / "app").mkdir(parents=True)
+        monkeypatch.setenv("ALLOWED_PROJECT_ROOTS", str(raiz))
+        self.entrada = {
+            "task_content": "anade un test", "branch": "feat/x-1", "plan": "plan",
+            "base_branch": "main", "directory": self.dir, "review_status": "no_revisada",
+            "created_at": "2026-10-06 18:00:00",
+        }
+        self.get_entry = MagicMock(return_value=self.entrada)
+        self.revisar = MagicMock(return_value={"revision_valida": True})
+        monkeypatch.setattr(main, "cc_get_dev_log_entry", self.get_entry)
+        monkeypatch.setattr(main, "cc_revisar_rama", self.revisar)
+
+    def _llamar(self):
+        return main.execute_tool("revisar_rama_dev", {"branch": "feat/x-1"}, 111, None)
+
+    def test_revisa_con_la_carpeta_revalidada(self):
+        assert self._llamar() == {"revision_valida": True}
+        self.revisar.assert_called_once_with(self.entrada, self.dir)
+
+    def test_rama_desconocida_no_revisa(self):
+        self.get_entry.return_value = None
+        assert "No hay ninguna tarea" in self._llamar()["error"]
+        self.revisar.assert_not_called()
+
+    def test_tarea_antigua_sin_carpeta_no_revisa(self):
+        self.entrada["directory"] = ""
+        assert "anterior" in self._llamar()["error"]
+        self.revisar.assert_not_called()
+
+    def test_carpeta_fuera_de_las_raices_no_revisa(self, tmp_path):
+        fuera = tmp_path / "fuera"
+        fuera.mkdir()
+        self.entrada["directory"] = str(fuera)
+        assert self._llamar()["error"].startswith("No se revisa")
+        self.revisar.assert_not_called()
+
+    def test_symlink_que_ahora_apunta_fuera_no_revisa(self, tmp_path):
+        # La ruta guardada pudo pasar la validacion al ejecutar y cambiar despues.
+        fuera = tmp_path / "fuera"
+        fuera.mkdir()
+        alias = tmp_path.resolve() / "proyectos" / "alias"
+        alias.symlink_to(fuera, target_is_directory=True)
+        self.entrada["directory"] = str(alias)
+        assert self._llamar()["error"].startswith("No se revisa")
+        self.revisar.assert_not_called()
+
+
+class TestListarRamasSinRevisar:
+    @pytest.fixture(autouse=True)
+    def _mocks(self, monkeypatch, tmp_path):
+        raiz = tmp_path.resolve() / "proyectos"
+        self.dir = str(raiz / "app")
+        (raiz / "app").mkdir(parents=True)
+        monkeypatch.setenv("ALLOWED_PROJECT_ROOTS", str(raiz))
+        self.fuera = tmp_path / "fuera"
+        self.fuera.mkdir()
+
+        def entrada(branch, directory, status="no_revisada"):
+            return {"task_content": f"tarea {branch}", "branch": branch, "base_branch": "main",
+                    "directory": directory, "review_status": status,
+                    "created_at": "2026-10-06 18:00:00"}
+
+        self.entradas = [
+            entrada("feat/pendiente-1", self.dir),
+            entrada("feat/integrada-2", self.dir),
+            entrada("feat/borrada-3", self.dir),
+            entrada("feat/fuera-4", str(self.fuera), status=""),
+        ]
+        estados = {"feat/pendiente-1": "pendiente", "feat/integrada-2": "integrada",
+                   "feat/borrada-3": "no_existe"}
+        self.estado = MagicMock(side_effect=lambda d, b, base: estados[b])
+        monkeypatch.setattr(main, "cc_get_unreviewed_dev_log_entries",
+                            MagicMock(return_value=self.entradas))
+        monkeypatch.setattr(main, "cc_estado_rama", self.estado)
+
+    def test_lista_solo_las_pendientes_y_no_lanza_git_fuera_de_las_raices(self):
+        res = main.execute_tool("listar_ramas_sin_revisar", {}, 111, None)
+        ramas = {r["branch"]: r for r in res["ramas"]}
+        assert set(ramas) == {"feat/pendiente-1", "feat/fuera-4"}
+        assert ramas["feat/pendiente-1"]["revision_estado"] == "no_revisada"
+        assert ramas["feat/fuera-4"]["estado_rama"] == "carpeta_no_permitida"
+        assert ramas["feat/fuera-4"]["revision_estado"] == "sin_revisar"
+        consultadas = {c.args[1] for c in self.estado.call_args_list}
+        assert "feat/fuera-4" not in consultadas
 
 
 # ===========================================================================

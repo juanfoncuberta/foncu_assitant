@@ -376,7 +376,11 @@ class TestExecuteTaskOnBranch:
     @pytest.fixture(autouse=True)
     def _plan_mock(self, mocker):
         mocker.patch("claude_code_executor._get_plan", return_value="mocked plan")
-        mocker.patch("claude_code_executor._run_reviewer", return_value="mocked review")
+        mocker.patch(
+            "claude_code_executor._revisar_con_reintento",
+            return_value={"texto": "mocked review", "estado": "completa",
+                          "segundos": 1.0, "lineas": 3},
+        )
 
     def test_branch_prefix_matches_classify_task(self, mocker):
         mock_run = mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
@@ -479,8 +483,582 @@ class TestExecuteTaskOnBranch:
     def test_reviewer_runs_after_successful_execution(self, mocker):
         mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
         result = ce.execute_task_on_branch("add feature", "/path")
-        ce._run_reviewer.assert_called_once()
+        ce._revisar_con_reintento.assert_called_once()
         assert result["review"] == "mocked review"
+        assert result["revision_estado"] == "completa"
+        assert result["revision_valida"] is True
+
+
+# ---------------------------------------------------------------------------
+# _run_reviewer — el reviewer ve el diff completo y declara su cobertura (A3)
+# ---------------------------------------------------------------------------
+
+
+def _numstat(*registros):
+    """Salida de `git diff --numstat -z`: 'anadidas\tborradas\truta\0' por archivo."""
+    return "".join(f"{a}\t{b}\t{ruta}\0" for a, b, ruta in registros)
+
+
+def _informe(rutas, revisados=None, total=None):
+    total = len(rutas) if total is None else total
+    revisados = total if revisados is None else revisados
+    lineas = "\n".join(f"- {r}" for r in rutas)
+    return (
+        "SIN HALLAZGOS\n\n"
+        f"COBERTURA: revisados {revisados} de {total} archivos (10 líneas de diff)\n"
+        f"Archivos revisados:\n{lineas}"
+    )
+
+
+class FakeGit:
+    """
+    Sustituye a _git: devuelve el numstat dado y, para cada archivo, su diff. Guarda
+    las llamadas para comprobar que se pide el diff entre ramas de cada archivo.
+    """
+
+    def __init__(self, diffs, numstat=None, rc_numstat=0, rc_diff=0, commits="0"):
+        self.diffs = diffs  # {ruta: texto del diff}
+        self.commits = commits  # salida de `git rev-list --count base..rama`
+        self.numstat = numstat if numstat is not None else _numstat(
+            *[(d.count("\n+"), d.count("\n-"), r) for r, d in diffs.items()]
+        )
+        self.rc_numstat = rc_numstat
+        self.rc_diff = rc_diff
+        self.calls = []
+
+    def __call__(self, args, cwd, timeout=30, strip=True):
+        self.calls.append(args)
+        if "--numstat" in args:
+            return self.rc_numstat, self.numstat, ""
+        if args[0] == "rev-list":
+            return 0, self.commits, ""
+        ruta = args[-1]
+        diff = self.diffs[ruta]
+        return self.rc_diff, (diff.strip() if strip else diff), ""  # como el _git real
+
+
+class TestRunReviewerCobertura:
+    @pytest.fixture(autouse=True)
+    def _entorno(self, mocker, monkeypatch, tmp_path):
+        monkeypatch.delenv("REVIEWER_ENABLED", raising=False)
+        mocker.patch("claude_code_executor.usage_log.record")
+        # Carpeta temporal conocida para poder comprobar que se borra al final.
+        self.tmp = tmp_path / "review"
+        mocker.patch(
+            "claude_code_executor.tempfile.mkdtemp",
+            side_effect=lambda **kw: (self.tmp.mkdir(), str(self.tmp))[1],
+        )
+
+    def _lanzar(self, mocker, git, informe):
+        mocker.patch.object(ce, "_git", side_effect=git)
+        visto = {}
+
+        def claude(cmd, **kwargs):
+            # Copia lo que el reviewer tendria en disco mientras se ejecuta.
+            visto["cmd"] = cmd
+            visto["archivos"] = {
+                p.name: p.read_text() for p in sorted(self.tmp.iterdir())
+            }
+            return cp(0, _json_output(informe))
+
+        mocker.patch("subprocess.run", side_effect=claude)
+        res = ce._run_reviewer("add feature", "plan", "feat/x-1", "main", "/repo")
+        return res, visto
+
+    def test_el_reviewer_recibe_el_diff_completo_aunque_supere_el_recorte(self, mocker):
+        # Regresion A3: el diff que ve el usuario se recorta; el del reviewer nunca.
+        grande = "diff --git a/a.py b/a.py\n" + "+x\n" * 4000
+        assert len(grande) > ce.DISPLAY_DIFF_MAX_CHARS
+        _, visto = self._lanzar(mocker, FakeGit({"a.py": grande}), _informe(["a.py"]))
+        [contenido] = visto["archivos"].values()
+        assert contenido == grande
+        assert "truncado" not in contenido
+
+    def test_el_diff_volcado_conserva_los_espacios_finales(self, mocker):
+        diff = "diff --git a/a.py b/a.py\n+foo  "
+        _, visto = self._lanzar(mocker, FakeGit({"a.py": diff}), _informe(["a.py"]))
+        assert list(visto["archivos"].values()) == [diff]
+
+    def test_cada_archivo_cambiado_va_en_el_encargo_con_su_diff(self, mocker):
+        git = FakeGit({"a.py": "+a", "dir/b c.py": "+b"})
+        _, visto = self._lanzar(mocker, git, _informe(["a.py", "dir/b c.py"]))
+        prompt = visto["cmd"][visto["cmd"].index("-p") + 1]
+        assert "2 files" in prompt
+        for ruta in ("a.py", "dir/b c.py"):
+            assert ruta in prompt
+        for nombre in visto["archivos"]:
+            assert str(self.tmp / nombre) in prompt
+        # Diff entre ramas, archivo a archivo, con la ruta literal.
+        por_archivo = [c for c in git.calls if "--numstat" not in c]
+        # Tres puntos: solo lo que anade la rama desde que salio de la base.
+        assert all("main...feat/x-1" in c and c[0] == "--literal-pathspecs" for c in por_archivo)
+        assert any("main...feat/x-1" in c for c in git.calls if "--numstat" in c)
+        assert [c[-1] for c in por_archivo] == ["a.py", "dir/b c.py"]
+
+    def test_el_reviewer_puede_leer_la_carpeta_de_diffs_pero_no_escribir(self, mocker):
+        _, visto = self._lanzar(mocker, FakeGit({"a.py": "+a"}), _informe(["a.py"]))
+        cmd = visto["cmd"]
+        dirs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--add-dir"]
+        assert dirs == ["/repo", str(self.tmp)]
+        assert cmd[cmd.index("--disallowedTools") + 1] == "Edit,Write"
+        assert "--allowedTools" not in cmd  # no gana permisos de Bash
+
+    def test_la_carpeta_temporal_se_borra_al_terminar(self, mocker):
+        self._lanzar(mocker, FakeGit({"a.py": "+a"}), _informe(["a.py"]))
+        assert not self.tmp.exists()
+
+    def test_la_carpeta_temporal_se_borra_aunque_falle_la_cli(self, mocker):
+        mocker.patch.object(ce, "_git", side_effect=FakeGit({"a.py": "+a"}))
+        mocker.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("claude", 1))
+        res = ce._run_reviewer("t", "p", "feat/x-1", "main", "/repo")
+        assert "no terminó" in res
+        assert not self.tmp.exists()
+
+    def test_cobertura_completa_va_en_la_primera_linea(self, mocker):
+        res, _ = self._lanzar(
+            mocker, FakeGit({"a.py": "+a", "b.py": "+b"}), _informe(["a.py", "b.py"])
+        )
+        primera, resto = res.split("\n\n", 1)
+        assert "revisados 2 de 2 archivos" in primera
+        assert "INCOMPLETA" not in res
+        assert resto.startswith("SIN HALLAZGOS")  # el informe va tal cual detras
+
+    def test_reviewer_que_declara_menos_archivos_es_incompleto(self, mocker):
+        res, _ = self._lanzar(
+            mocker, FakeGit({"a.py": "+a", "b.py": "+b"}),
+            _informe(["a.py", "b.py"], revisados=1),
+        )
+        assert res.startswith("⚠️ REVISIÓN INCOMPLETA")
+        assert "1 de 2 archivos" in res.splitlines()[0]
+
+    def test_reviewer_que_no_nombra_un_archivo_es_incompleto(self, mocker):
+        # Dice "2 de 2" pero solo nombra uno: no se le cree.
+        res, _ = self._lanzar(
+            mocker, FakeGit({"a.py": "+a", "b.py": "+b"}),
+            _informe(["a.py"], revisados=2, total=2),
+        )
+        primera = res.splitlines()[0]
+        assert primera.startswith("⚠️ REVISIÓN INCOMPLETA")
+        assert "b.py" in primera
+
+    def test_una_ruta_contenida_en_otra_no_cuenta_como_revisada(self, mocker):
+        # Nombrar tests/test_main.py no es nombrar main.py.
+        res, _ = self._lanzar(
+            mocker, FakeGit({"main.py": "+a", "tests/test_main.py": "+b"}),
+            _informe(["tests/test_main.py"], revisados=2, total=2),
+        )
+        primera = res.splitlines()[0]
+        assert primera.startswith("⚠️ REVISIÓN INCOMPLETA")
+        assert "main.py" in primera.split("listar como revisados:")[1]
+
+    def test_archivo_listado_como_sin_revisar_es_incompleto(self, mocker):
+        informe = _informe(["a.py", "b.py"], revisados=2, total=2) + (
+            "\nArchivos sin revisar:\n- b.py"
+        )
+        res, _ = self._lanzar(mocker, FakeGit({"a.py": "+a", "b.py": "+b"}), informe)
+        assert res.startswith("⚠️ REVISIÓN INCOMPLETA")
+
+    def test_rutas_mencionadas_en_hallazgos_no_suplen_la_lista(self, mocker):
+        # b.py sale en el cuerpo del informe, pero no en "Archivos revisados".
+        informe = "BLOQUEA EL COMMIT\n\nb.py linea 3: fallo\n\n" + _informe(
+            ["a.py"], revisados=2, total=2
+        ).split("\n\n", 1)[1]
+        res, _ = self._lanzar(mocker, FakeGit({"a.py": "+a", "b.py": "+b"}), informe)
+        assert res.startswith("⚠️ REVISIÓN INCOMPLETA")
+
+    def test_acepta_rutas_entre_comillas_invertidas_y_en_negrita(self, mocker):
+        informe = (
+            "SIN HALLAZGOS\n\nCOBERTURA: revisados 1 de 1 archivos (3 líneas de diff)\n"
+            "**Archivos revisados:**\n- `a.py`\n"
+        )
+        res, _ = self._lanzar(mocker, FakeGit({"a.py": "+a"}), informe)
+        assert "INCOMPLETA" not in res
+
+    @pytest.mark.parametrize("cabecera,vineta", [
+        ("**Archivos revisados**:", "- "),
+        ("Archivos revisados (2):", "* "),
+        ("### Archivos revisados", "+ "),
+    ])
+    def test_tolera_variaciones_de_formato_markdown(self, mocker, cabecera, vineta):
+        # Que un cambio de formato no dispare una falsa "REVISIÓN INCOMPLETA".
+        informe = (
+            "SIN HALLAZGOS\n\nCOBERTURA: revisados 2 de 2 archivos (3 líneas de diff)\n"
+            f"{cabecera}\n{vineta}a.py\n{vineta}b.py\n"
+        )
+        res, _ = self._lanzar(mocker, FakeGit({"a.py": "+a", "b.py": "+b"}), informe)
+        assert "INCOMPLETA" not in res
+
+    def test_reviewer_que_cuenta_mal_el_total_es_incompleto(self, mocker):
+        # Revisa los 7 que cree que hay, pero en realidad cambiaron 8.
+        rutas = [f"f{i}.py" for i in range(8)]
+        res, _ = self._lanzar(
+            mocker, FakeGit({r: "+x" for r in rutas}),
+            _informe(rutas, revisados=7, total=7),
+        )
+        assert res.startswith("⚠️ REVISIÓN INCOMPLETA")
+
+    def test_reviewer_que_cree_que_hay_mas_archivos_es_incompleto(self, mocker):
+        # "2 de 3" con 2 cambios: el reviewer trabaja con otra lista que la de git.
+        res, _ = self._lanzar(
+            mocker, FakeGit({"a.py": "+a", "b.py": "+b"}),
+            _informe(["a.py", "b.py"], revisados=2, total=3),
+        )
+        assert res.startswith("⚠️ REVISIÓN INCOMPLETA")
+
+    def test_informe_sin_linea_de_cobertura_es_incompleto(self, mocker):
+        res, _ = self._lanzar(mocker, FakeGit({"a.py": "+a"}), "SIN HALLAZGOS\n\na.py ok")
+        assert res.startswith("⚠️ REVISIÓN INCOMPLETA")
+        assert "no se puede leer" in res.splitlines()[0]
+
+    def test_sin_cambios_no_exige_cobertura(self, mocker):
+        res, _ = self._lanzar(mocker, FakeGit({}, numstat=""), "SIN HALLAZGOS")
+        assert "INCOMPLETA" not in res
+        assert "revisados 0 de 0 archivos" in res.splitlines()[0]
+
+    def test_diff_vacio_con_commits_propios_no_cuenta_como_revisado(self, mocker):
+        # "0 de 0 archivos" no vale si la rama tiene commits: algo falla en la base.
+        res, visto = self._lanzar(mocker, FakeGit({}, numstat="", commits="2"), "SIN HALLAZGOS")
+        assert res.startswith("(sin revisar")
+        assert visto == {}  # no se llego a lanzar el reviewer
+
+    def test_diff_vacio_sin_poder_contar_commits_no_cuenta_como_revisado(self, mocker):
+        res, _ = self._lanzar(mocker, FakeGit({}, numstat="", commits="fatal"), "SIN HALLAZGOS")
+        assert res.startswith("(sin revisar")
+
+    def test_revision_desactivada_avisa_como_no_revisada(self, monkeypatch):
+        monkeypatch.setenv("REVIEWER_ENABLED", "false")
+        res = ce._revision("t", "p", "feat/x-1", "main", "/repo")
+        assert res["estado"] == "desactivada"
+        assert res["texto"].startswith("❌ NO REVISADA")
+
+    def test_archivo_binario_entra_en_la_lista(self, mocker):
+        git = FakeGit({"logo.png": "Binary files differ"}, numstat=_numstat(("-", "-", "logo.png")))
+        res, visto = self._lanzar(mocker, git, _informe(["logo.png"]))
+        prompt = visto["cmd"][visto["cmd"].index("-p") + 1]
+        assert "logo.png (binary" in prompt
+        assert "INCOMPLETA" not in res
+
+    def test_diff_grande_pide_revisar_archivo_a_archivo(self, mocker):
+        lineas = ce.REVIEW_PER_FILE_THRESHOLD_LINES + 1
+        git = FakeGit({"a.py": "+x"}, numstat=_numstat((lineas, 0, "a.py")))
+        _, visto = self._lanzar(mocker, git, _informe(["a.py"]))
+        prompt = visto["cmd"][visto["cmd"].index("-p") + 1]
+        assert "file by file" in prompt
+
+    def test_diff_pequeno_no_pide_revisar_archivo_a_archivo(self, mocker):
+        git = FakeGit({"a.py": "+x"}, numstat=_numstat((3, 1, "a.py")))
+        _, visto = self._lanzar(mocker, git, _informe(["a.py"]))
+        prompt = visto["cmd"][visto["cmd"].index("-p") + 1]
+        assert "file by file" not in prompt
+
+    def test_no_poder_escribir_el_diff_no_lanza_el_reviewer_ni_revienta(self, mocker):
+        mocker.patch.object(ce, "_git", side_effect=FakeGit({"a.py": "+a"}))
+        mocker.patch("builtins.open", side_effect=OSError("disco lleno"))
+        run = mocker.patch("subprocess.run")
+        res = ce._run_reviewer("t", "p", "feat/x-1", "main", "/repo")
+        run.assert_not_called()
+        assert res.startswith("(sin revisar")
+        assert not self.tmp.exists()
+
+    @pytest.mark.parametrize("git", [
+        FakeGit({"a.py": "+a"}, rc_numstat=128),
+        FakeGit({"a.py": "+a"}, numstat="esto no es numstat"),
+        FakeGit({"a.py": "+a"}, rc_diff=1),
+    ], ids=["numstat-falla", "numstat-ilegible", "diff-de-un-archivo-falla"])
+    def test_sin_lista_fiable_no_se_lanza_el_reviewer(self, mocker, git):
+        # Mejor "sin revisar" que una revision sobre una lista incompleta.
+        mocker.patch.object(ce, "_git", side_effect=git)
+        run = mocker.patch("subprocess.run")
+        res = ce._run_reviewer("t", "p", "feat/x-1", "main", "/repo")
+        run.assert_not_called()
+        assert res.startswith("(sin revisar")
+        assert not self.tmp.exists()
+
+    def test_fallo_de_la_cli_no_lleva_cabecera_de_cobertura(self, mocker):
+        mocker.patch.object(ce, "_git", side_effect=FakeGit({"a.py": "+a"}))
+        mocker.patch("subprocess.run", return_value=cp(1, "", "boom"))
+        res = ce._run_reviewer("t", "p", "feat/x-1", "main", "/repo")
+        assert res == "(la revisión falló — revisa el diff a mano)"
+
+
+_REV_OK = {"texto": "Cobertura...\n\nSIN HALLAZGOS", "estado": "completa",
+           "segundos": 12.0, "lineas": 40}
+
+
+def _rev(estado, texto=None, segundos=10.0, lineas=40):
+    return {"texto": texto or f"({estado})", "estado": estado,
+            "segundos": segundos, "lineas": lineas}
+
+
+class TestTimeoutRevision:
+    def test_cambio_pequeno_usa_la_base(self):
+        assert ce._timeout_revision(0) == ce.REVIEW_TIMEOUT_SECONDS
+
+    def test_crece_con_las_lineas(self):
+        assert ce._timeout_revision(100) > ce._timeout_revision(10) > ce.REVIEW_TIMEOUT_SECONDS
+
+    def test_nunca_pasa_del_maximo(self):
+        assert ce._timeout_revision(10**6) == ce.REVIEW_TIMEOUT_MAX_SECONDS
+
+    def test_la_revision_usa_el_timeout_segun_el_tamano(self, mocker, monkeypatch):
+        monkeypatch.delenv("REVIEWER_ENABLED", raising=False)
+        mocker.patch("claude_code_executor.usage_log.record")
+        mocker.patch.object(ce, "_git", side_effect=FakeGit(
+            {"a.py": "+x"}, numstat=_numstat((300, 100, "a.py"))))
+        run = mocker.patch("subprocess.run", return_value=cp(0, _json_output(_informe(["a.py"]))))
+        res = ce._revision("t", "p", "feat/x-1", "main", "/repo")
+        assert run.call_args.kwargs["timeout"] == ce._timeout_revision(400)
+        assert res["estado"] == "completa"
+        assert res["lineas"] == 400
+        assert res["segundos"] is not None
+
+
+class TestRevisarConReintento:
+    def _con(self, mocker, *resultados):
+        return mocker.patch.object(ce, "_revision", side_effect=list(resultados))
+
+    def test_completa_a_la_primera_no_reintenta(self, mocker):
+        rev = self._con(mocker, _REV_OK)
+        res = ce._revisar_con_reintento("t", "p", "feat/x-1", "main", "/repo")
+        assert res["estado"] == "completa"
+        assert rev.call_count == 1
+
+    def test_desactivada_no_reintenta(self, mocker):
+        rev = self._con(mocker, _rev("desactivada"))
+        res = ce._revisar_con_reintento("t", "p", "feat/x-1", "main", "/repo")
+        assert res["estado"] == "desactivada"
+        assert rev.call_count == 1
+
+    @pytest.mark.parametrize("primera", ["incompleta", "sin_revisar"])
+    def test_reintenta_archivo_a_archivo_con_el_tiempo_maximo(self, mocker, primera):
+        rev = self._con(mocker, _rev(primera, segundos=240.0), dict(_REV_OK))
+        res = ce._revisar_con_reintento("t", "p", "feat/x-1", "main", "/repo")
+        assert rev.call_count == 2
+        segunda = rev.call_args_list[1].kwargs
+        assert segunda == {"por_archivo": True, "timeout": ce.REVIEW_TIMEOUT_MAX_SECONDS}
+        assert res["estado"] == "completa"
+        assert "segundo intento" in res["texto"]
+        assert res["segundos"] == 252.0  # suma de los dos intentos
+
+    def test_conserva_el_informe_parcial_del_primer_intento(self, mocker):
+        self._con(mocker,
+                  _rev("incompleta", "⚠️ REVISIÓN INCOMPLETA: 6 de 7\n\nBloqueante: hallazgo X"),
+                  _rev("sin_revisar", "(la revisión no terminó en 600s — x)"))
+        res = ce._revisar_con_reintento("t", "p", "feat/x-1", "main", "/repo")
+        assert res["estado"] == "no_revisada"
+        assert "Informe parcial del primer intento" in res["texto"]
+        assert "Bloqueante: hallazgo X" in res["texto"]
+
+    def test_dos_fallos_dejan_la_rama_no_revisada(self, mocker):
+        self._con(mocker, _rev("sin_revisar", "(la revisión falló — x)"),
+                  _rev("incompleta", "⚠️ REVISIÓN INCOMPLETA: 1 de 2\n\ninforme"))
+        res = ce._revisar_con_reintento("t", "p", "feat/x-1", "main", "/repo")
+        assert res["estado"] == "no_revisada"
+        primera_linea = res["texto"].splitlines()[0]
+        assert primera_linea.startswith("❌ NO REVISADA")
+        assert "revisar_rama_dev" in primera_linea
+        assert "(la revisión falló — x)" in res["texto"]
+        assert "⚠️ REVISIÓN INCOMPLETA: 1 de 2" in res["texto"]
+        assert "Informe parcial del segundo intento:" in res["texto"]
+
+
+class TestRevisionObligatoriaEnElFlujo:
+    @pytest.fixture(autouse=True)
+    def _plan(self, mocker):
+        mocker.patch("claude_code_executor._get_plan", return_value="plan")
+
+    def test_rama_no_revisada_no_es_valida_y_queda_en_dev_log(self, mocker):
+        mocker.patch.object(ce, "_revisar_con_reintento",
+                            return_value=_rev("no_revisada", "❌ NO REVISADA: x"))
+        mocker.patch("subprocess.run", side_effect=_branch_exec_calls(original="develop"))
+        res = ce.execute_task_on_branch("add feature", "/path")
+        assert res["revision_valida"] is False
+        assert res["revision_estado"] == "no_revisada"
+        assert res["review"].startswith("❌ NO REVISADA")
+        [pendiente] = ce.get_unreviewed_dev_log_entries()
+        assert (pendiente["branch"], pendiente["base_branch"], pendiente["directory"]) == (
+            res["branch"], "develop", "/path")
+
+    def test_revision_completa_guarda_duracion_y_lineas(self, mocker):
+        mocker.patch.object(ce, "_revisar_con_reintento", return_value=_REV_OK)
+        mocker.patch("subprocess.run", side_effect=_branch_exec_calls())
+        res = ce.execute_task_on_branch("add feature", "/path")
+        assert res["revision_valida"] is True
+        assert ce.get_unreviewed_dev_log_entries() == []
+        import sqlite3 as _sq
+        with _sq.connect(ce.DB_PATH) as conn:
+            fila = conn.execute(
+                "SELECT review_status, review_seconds, review_lines FROM dev_log").fetchone()
+        assert fila == ("completa", 12.0, 40)
+
+    def test_detached_head_no_crea_rama_ni_ejecuta(self, mocker):
+        run = mocker.patch("subprocess.run", return_value=cp(0, "HEAD"))
+        res = ce.execute_task_on_branch("add feature", "/path")
+        assert "detached HEAD" in res["error"]
+        assert run.call_count == 1  # solo el rev-parse
+        assert res["branch"] is None
+
+    def test_fallo_del_commit_automatico_deja_la_rama_no_revisada(self, mocker):
+        revisar = mocker.patch.object(ce, "_revisar_con_reintento")
+        calls = [
+            cp(0, "main"), cp(0, ""), cp(0, _json_output()), cp(0, ""), cp(0, "+changes"),
+            cp(0, "M file.py"),          # git status -> sucio, entra el fallback
+            cp(0, "M file.py"),          # git status dentro de _fallback_commit
+            cp(0, ""),                   # git add -A
+            cp(1, "", "boom"),           # git commit falla
+            cp(0, ""), cp(0, ""),        # _checkout_safe
+        ]
+        mocker.patch("subprocess.run", side_effect=calls)
+        res = ce.execute_task_on_branch("add feature", "/path")
+        revisar.assert_not_called()
+        assert res["revision_valida"] is False
+        assert res["revision_estado"] == "no_revisada"
+        assert res["review"].startswith("❌ NO REVISADA")
+
+
+class TestDevLogRevision:
+    def _guardar(self, branch, estado, directory="/repo", base="main"):
+        ce._save_dev_log("tarea", branch, "resumen", plan="plan", base_branch=base,
+                         directory=directory, revision=_rev(estado))
+
+    def test_lista_solo_las_no_completas_con_carpeta(self):
+        self._guardar("feat/a-1", "completa")
+        self._guardar("feat/b-2", "no_revisada")
+        self._guardar("feat/c-3", "desactivada")
+        ce._save_dev_log("antigua", "feat/vieja-4", "resumen")  # sin carpeta ni base
+        assert [e["branch"] for e in ce.get_unreviewed_dev_log_entries()] == [
+            "feat/c-3", "feat/b-2"]
+
+    def test_una_revision_nueva_la_saca_de_la_lista(self):
+        self._guardar("feat/b-2", "no_revisada")
+        ce._actualizar_revision_dev_log("feat/b-2", _REV_OK)
+        assert ce.get_unreviewed_dev_log_entries() == []
+        assert ce.get_dev_log_entry("feat/b-2")["review_status"] == "completa"
+
+    def test_get_dev_log_entry_devuelve_lo_necesario_para_revisar(self):
+        self._guardar("feat/b-2", "no_revisada", directory="/srv/app", base="develop")
+        e = ce.get_dev_log_entry("feat/b-2")
+        assert (e["task_content"], e["plan"], e["base_branch"], e["directory"]) == (
+            "tarea", "plan", "develop", "/srv/app")
+        assert ce.get_dev_log_entry("no/existe-0") is None
+
+    def test_migra_una_tabla_antigua(self):
+        import sqlite3 as _sq
+        with _sq.connect(ce.DB_PATH) as conn:
+            conn.execute("CREATE TABLE dev_log (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                         "task_content TEXT NOT NULL, branch TEXT NOT NULL, summary TEXT NOT NULL, "
+                         "created_at TEXT NOT NULL DEFAULT (datetime('now')))")
+            conn.execute("INSERT INTO dev_log (task_content, branch, summary) "
+                         "VALUES ('vieja', 'feat/v-1', 's')")
+        assert ce.get_dev_log_entry("feat/v-1")["review_status"] == ""
+        assert ce.get_unreviewed_dev_log_entries() == []
+
+
+@pytest.fixture()
+def repo_git(tmp_path):
+    """Repo git real: main con un commit y una rama feat/x-1 con otro encima."""
+    import shutil as _sh
+    if not _sh.which("git"):
+        pytest.skip("git no disponible")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def g(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (repo / "a.py").write_text("a\n"); g("add", "."); g("commit", "-qm", "base")
+    g("checkout", "-qb", "feat/x-1")
+    (repo / "b.py").write_text("b\n"); g("add", "."); g("commit", "-qm", "rama")
+    g("checkout", "-q", "main")
+    return repo, g
+
+
+class TestEstadoRama:
+    def test_rama_pendiente(self, repo_git):
+        repo, _ = repo_git
+        assert ce.estado_rama(str(repo), "feat/x-1", "main") == "pendiente"
+
+    def test_rama_integrada(self, repo_git):
+        repo, g = repo_git
+        g("merge", "-q", "--ff-only", "feat/x-1")
+        assert ce.estado_rama(str(repo), "feat/x-1", "main") == "integrada"
+
+    def test_rama_borrada(self, repo_git):
+        repo, _ = repo_git
+        assert ce.estado_rama(str(repo), "feat/no-1", "main") == "no_existe"
+
+    def test_base_head_no_da_revision_vacia_por_buena(self, mocker, repo_git, monkeypatch):
+        # Detached HEAD: estando en la rama, HEAD...rama sale vacio (y HEAD..rama no
+        # tiene commits), asi que se rechaza "HEAD" como base de forma explicita.
+        repo, g = repo_git
+        g("checkout", "-q", "feat/x-1")
+        monkeypatch.delenv("REVIEWER_ENABLED", raising=False)
+        claude = mocker.patch.object(ce, "_lanzar_reviewer")
+        res = ce._revision("t", "p", "feat/x-1", "HEAD", str(repo))
+        assert res["estado"] == "sin_revisar"
+        assert "detached HEAD" in res["texto"]
+        claude.assert_not_called()
+
+    def test_el_manifiesto_ignora_lo_que_avanzo_la_base(self, repo_git):
+        # Revisar dias despues: main ya tiene commits nuevos que no son de la rama.
+        repo, g = repo_git
+        (repo / "c.py").write_text("c\n"); g("add", "."); g("commit", "-qm", "main avanza")
+        manifiesto = ce._manifiesto_diff("main", "feat/x-1", str(repo))
+        assert [a["path"] for a in manifiesto] == ["b.py"]
+
+
+class TestRevisarRama:
+    def _entrada(self, branch="feat/x-1"):
+        return {"task_content": "t", "branch": branch, "plan": "p", "base_branch": "main",
+                "directory": "/x", "review_status": "no_revisada", "created_at": ""}
+
+    def test_rama_borrada_da_error_sin_revisar(self, mocker, repo_git):
+        repo, _ = repo_git
+        revisar = mocker.patch.object(ce, "_revisar_con_reintento")
+        res = ce.revisar_rama(self._entrada("feat/no-1"), str(repo))
+        assert "ya no existe" in res["error"]
+        revisar.assert_not_called()
+
+    def test_revisa_sin_cambiar_de_rama_y_actualiza_dev_log(self, mocker, repo_git):
+        repo, _ = repo_git
+        ce._save_dev_log("t", "feat/x-1", "s", plan="p", base_branch="main",
+                         directory=str(repo), revision=_rev("no_revisada"))
+        revisar = mocker.patch.object(ce, "_revisar_con_reintento", return_value=_REV_OK)
+        res = ce.revisar_rama(self._entrada(), str(repo))
+        revisar.assert_called_once_with("t", "p", "feat/x-1", "main", str(repo))
+        assert res["revision_valida"] is True
+        assert "aviso" not in res
+        assert ce.get_dev_log_entry("feat/x-1")["review_status"] == "completa"
+        actual = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo,
+                                capture_output=True, text=True).stdout.strip()
+        assert actual == "main"
+
+    @pytest.mark.parametrize("merge", [["--ff-only"], ["--no-ff", "-m", "merge"]])
+    def test_rama_ya_integrada_no_se_revisa_ni_se_marca_revisada(self, mocker, repo_git, merge):
+        repo, g = repo_git
+        ce._save_dev_log("t", "feat/x-1", "s", plan="p", base_branch="main",
+                         directory=str(repo), revision=_rev("no_revisada"))
+        g("merge", "-q", *merge, "feat/x-1")
+        revisar = mocker.patch.object(ce, "_revisar_con_reintento", return_value=_REV_OK)
+        res = ce.revisar_rama(self._entrada(), str(repo))
+        assert "ya está integrada" in res["error"]
+        assert res["revision_valida"] is False
+        revisar.assert_not_called()
+        assert ce.get_dev_log_entry("feat/x-1")["review_status"] == "no_revisada"
+
+
+class TestDiffParaMostrar:
+    def test_diff_de_rama_se_recorta_solo_para_mostrar(self, mocker):
+        mocker.patch("claude_code_executor._get_plan", return_value="plan")
+        mocker.patch("claude_code_executor._revisar_con_reintento", return_value=_REV_OK)
+        largo = "+" * (ce.DISPLAY_DIFF_MAX_CHARS + 10)
+        calls = _branch_exec_calls()
+        calls[4] = cp(0, largo)  # git diff <original>
+        mocker.patch("subprocess.run", side_effect=calls)
+        res = ce.execute_task_on_branch("add feature", "/path")
+        assert res["git_diff"] == "+" * ce.DISPLAY_DIFF_MAX_CHARS + "…(truncado)"
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +1142,11 @@ class TestExecuteTaskOnBranchDevLog:
     @pytest.fixture(autouse=True)
     def _plan_mock(self, mocker):
         mocker.patch("claude_code_executor._get_plan", return_value="mocked plan")
-        mocker.patch("claude_code_executor._run_reviewer", return_value="mocked review")
+        mocker.patch(
+            "claude_code_executor._revisar_con_reintento",
+            return_value={"texto": "mocked review", "estado": "completa",
+                          "segundos": 1.0, "lineas": 3},
+        )
 
     def test_saves_dev_log_on_success(self, mocker, tmp_path, monkeypatch):
         monkeypatch.setattr(ce, "DB_PATH", str(tmp_path / "test.db"))

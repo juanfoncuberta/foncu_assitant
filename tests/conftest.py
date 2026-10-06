@@ -1,5 +1,6 @@
 import pytest
 
+import claude_code_executor
 import project_directory_map
 import project_map
 
@@ -20,6 +21,9 @@ def _base_de_datos_temporal_para_config(tmp_path, monkeypatch):
     # proyecto de cada gasto: sin esto, esos tests leerian el assistant.db real.
     monkeypatch.setattr(project_map, "DB_PATH", str(tmp_path / "test_project_map.db"))
     monkeypatch.setattr(project_directory_map, "DB_PATH", str(tmp_path / "test_project_map.db"))
+    # claude_code_executor (dev_log) tambien: sin esto los tests de execute_task_on_branch
+    # escribian dev_log en el assistant.db de la carpeta donde se lanzan.
+    monkeypatch.setattr(claude_code_executor, "DB_PATH", str(tmp_path / "test_dev_log.db"))
 
 
 # Precios INVENTADOS, distintos de los reales a proposito: si un test pasara solo
